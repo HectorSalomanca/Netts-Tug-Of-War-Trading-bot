@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.tugofwar.trader</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Library/Developer/CommandLineTools/usr/bin/python3</string>
+        <string>-u</string>
+        <string>/Users/j23nett/CascadeProjects/Tug-Of-War System/referee/engine_v2.py</string>
+        <string>--interval</string>
+        <string>15</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/j23nett/CascadeProjects/Tug-Of-War System</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/j23nett/CascadeProjects/Tug-Of-War System/logs/engine.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/j23nett/CascadeProjects/Tug-Of-War System/logs/engine_error.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/j23nett/Library/Python/3.9/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>/Users/j23nett</string>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+</dict>
+</plist>
