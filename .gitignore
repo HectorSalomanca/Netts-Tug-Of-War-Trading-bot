@@ -1,0 +1,57 @@
+# ── Secrets (NEVER commit these) ─────────────────────────────
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# ── Python ────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+pip-log.txt
+
+# ── Logs (generated at runtime, don't commit) ─────────────────
+logs/
+*.log
+
+# ── macOS ─────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# ── Node / Next.js (dashboard) ────────────────────────────────
+dashboard/node_modules/
+dashboard/.next/
+dashboard/out/
+dashboard/.vercel/
+dashboard/.netlify/
+dashboard/windsurf_deployment.yaml
+
+# ── launchd plists (machine-specific) ────────────────────────
+# Keep in repo as templates but note they contain local paths
+# com.tugofwar.trader.plist
+# com.tugofwar.tape.plist
+
+# ── Backtest output ───────────────────────────────────────────
+logs/backtest_trades.csv
+
+# ── IDE ───────────────────────────────────────────────────────
+.windsurf/
+.vscode/
+.idea/
+*.swp
+*.swo
