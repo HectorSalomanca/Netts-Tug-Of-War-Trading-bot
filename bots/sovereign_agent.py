@@ -1,0 +1,340 @@
+"""
+Sovereign Agent V2 — Institutional/Rational Bot
+
+Signals:
+  - Adaptive Fractional Differencing (AFD) momentum (from feature_factory)
+  - Pure Alpha (SPY/QQQ-neutralized returns)
+  - Opening Range Breakout (ORB): first 30-min high/low sets the range
+  - SEC 8-K / news sentiment (from scout_news Supabase signals)
+  - Kelly Criterion position sizing
+
+Holds until 3:55 PM ET or stop/take fires.
+"""
+
+import os
+import sys
+import numpy as np
+import pandas as pd
+from datetime import datetime, timezone, timedelta
+from typing import Optional
+
+import pytz
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
+from alpaca.data.enums import DataFeed
+from dotenv import load_dotenv
+from supabase import create_client, Client
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from quant.feature_factory import build_features
+
+load_dotenv()
+
+ALPACA_API_KEY    = os.getenv("ALPACA_API_KEY")
+ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
+SUPABASE_URL      = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_ANON_KEY")
+USER_ID           = os.getenv("USER_ID")
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+
+ET = pytz.timezone("America/New_York")
+ORB_MINUTES = 30   # Opening Range = first 30 min
+
+
+# ── Data Fetchers ─────────────────────────────────────────────────────────────
+
+def get_daily_bars(symbol: str, days: int = 90) -> Optional[pd.DataFrame]:
+    try:
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=days)
+        req = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TimeFrame.Day,
+            start=start, end=end,
+            feed=DataFeed.IEX,
+        )
+        bars = data_client.get_stock_bars(req)
+        df = bars.df
+        if isinstance(df.index, pd.MultiIndex):
+            df = df.xs(symbol, level=0)
+        return df.sort_index()
+    except Exception as e:
+        print(f"[SOVEREIGN] Daily bars error for {symbol}: {e}")
+        return None
+
+
+def get_benchmark_bars(symbol: str, days: int = 90) -> Optional[np.ndarray]:
+    try:
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=days)
+        req = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TimeFrame.Day,
+            start=start, end=end,
+            feed=DataFeed.IEX,
+        )
+        bars = data_client.get_stock_bars(req)
+        df = bars.df
+        if isinstance(df.index, pd.MultiIndex):
+            df = df.xs(symbol, level=0)
+        return df.sort_index()["close"].values
+    except Exception:
+        return None
+
+
+def get_intraday_bars(symbol: str) -> Optional[pd.DataFrame]:
+    """Fetch today's 1-min bars for ORB calculation."""
+    try:
+        now_et = datetime.now(ET)
+        start_et = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+        start_utc = start_et.astimezone(timezone.utc)
+        end_utc = datetime.now(timezone.utc)
+        req = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TimeFrame.Minute,
+            start=start_utc, end=end_utc,
+            feed=DataFeed.IEX,
+        )
+        bars = data_client.get_stock_bars(req)
+        df = bars.df
+        if isinstance(df.index, pd.MultiIndex):
+            df = df.xs(symbol, level=0)
+        return df.sort_index()
+    except Exception:
+        return None
+
+
+# ── Opening Range Breakout ────────────────────────────────────────────────────
+
+def compute_orb(df_1min: Optional[pd.DataFrame]) -> dict:
+    """
+    Returns ORB signal: direction + strength based on current price vs range.
+    """
+    if df_1min is None or len(df_1min) < ORB_MINUTES:
+        return {"orb_direction": "neutral", "orb_strength": 0.0, "orb_range": 0.0}
+
+    orb_bars = df_1min.iloc[:ORB_MINUTES]
+    orb_high = float(orb_bars["high"].max())
+    orb_low  = float(orb_bars["low"].min())
+    orb_range = orb_high - orb_low
+
+    current_price = float(df_1min["close"].iloc[-1])
+
+    if orb_range == 0:
+        return {"orb_direction": "neutral", "orb_strength": 0.0, "orb_range": 0.0}
+
+    if current_price > orb_high:
+        strength = min((current_price - orb_high) / orb_range, 1.0)
+        return {"orb_direction": "buy", "orb_strength": round(strength, 4), "orb_range": round(orb_range, 4)}
+    elif current_price < orb_low:
+        strength = min((orb_low - current_price) / orb_range, 1.0)
+        return {"orb_direction": "sell", "orb_strength": round(strength, 4), "orb_range": round(orb_range, 4)}
+
+    return {"orb_direction": "neutral", "orb_strength": 0.0, "orb_range": round(orb_range, 4)}
+
+
+# ── News Sentiment from Supabase ──────────────────────────────────────────────
+
+def get_news_sentiment(symbol: str) -> tuple:
+    try:
+        result = (
+            supabase.table("signals")
+            .select("direction, confidence, bayesian_score, created_at")
+            .eq("symbol", symbol)
+            .eq("signal_type", "8k_news_bayesian")
+            .order("created_at", desc=True)
+            .limit(3)
+            .execute()
+        )
+        rows = result.data
+        if not rows:
+            return "neutral", 0.5, 0.5
+
+        buy_conf  = [r["confidence"] for r in rows if r["direction"] == "buy"]
+        sell_conf = [r["confidence"] for r in rows if r["direction"] == "sell"]
+        avg_bayes = np.mean([r.get("bayesian_score", 0.5) for r in rows])
+
+        avg_buy  = np.mean(buy_conf)  if buy_conf  else 0.0
+        avg_sell = np.mean(sell_conf) if sell_conf else 0.0
+
+        if avg_buy > avg_sell and avg_buy > 0.55:
+            return "buy", float(avg_buy), float(avg_bayes)
+        elif avg_sell > avg_buy and avg_sell > 0.55:
+            return "sell", float(avg_sell), float(avg_bayes)
+        return "neutral", 0.5, float(avg_bayes)
+    except Exception:
+        return "neutral", 0.5, 0.5
+
+
+# ── Kelly Criterion ───────────────────────────────────────────────────────────
+
+def compute_kelly(win_rate: float, avg_win: float, avg_loss: float) -> float:
+    if avg_loss == 0:
+        return 0.0
+    b = avg_win / avg_loss
+    q = 1 - win_rate
+    kelly = (b * win_rate - q) / b
+    return max(0.0, min(kelly * 0.5, 0.25))
+
+
+# ── Main Analysis ─────────────────────────────────────────────────────────────
+
+def analyze(symbol: str, regime_state: str = "trend") -> dict:
+    print(f"[SOVEREIGN] Analyzing {symbol} (regime={regime_state})...")
+
+    df = get_daily_bars(symbol, days=90)
+    if df is None or len(df) < 20:
+        return _neutral(symbol)
+
+    prices = df["close"].values
+    spy_prices = get_benchmark_bars("SPY", days=90)
+    qqq_prices = get_benchmark_bars("QQQ", days=90)
+
+    # ── Feature Factory ───────────────────────────────────────
+    if spy_prices is not None and qqq_prices is not None:
+        features = build_features(prices, spy_prices, qqq_prices)
+    else:
+        features = {"afd_momentum": 0.0, "pure_alpha": 0.0, "d_value": 1.0, "neutralized_vol": 0.3}
+
+    afd_mom   = features["afd_momentum"]
+    pure_alpha = features["pure_alpha"]
+    neut_vol  = features["neutralized_vol"]
+
+    # ── ORB ───────────────────────────────────────────────────
+    df_1min = get_intraday_bars(symbol)
+    orb = compute_orb(df_1min)
+
+    # ── News Sentiment ────────────────────────────────────────
+    news_dir, news_conf, bayesian_score = get_news_sentiment(symbol)
+
+    # ── Kelly ─────────────────────────────────────────────────
+    returns = np.diff(prices) / prices[:-1]
+    wins    = returns[returns > 0]
+    losses  = returns[returns < 0]
+    win_rate  = len(wins) / len(returns) if len(returns) > 0 else 0.5
+    avg_win   = float(np.mean(wins))   if len(wins)   > 0 else 0.01
+    avg_loss  = float(abs(np.mean(losses))) if len(losses) > 0 else 0.01
+    kelly_fraction = compute_kelly(win_rate, avg_win, avg_loss)
+
+    # ── Score Aggregation ─────────────────────────────────────
+    bull = 0
+    bear = 0
+    details = {}
+
+    # AFD momentum
+    if afd_mom > 0.0001:
+        bull += 2
+        details["afd_bullish"] = True
+    elif afd_mom < -0.0001:
+        bear += 2
+        details["afd_bullish"] = False
+    details["afd_momentum"] = round(afd_mom, 6)
+
+    # Pure alpha
+    if pure_alpha > 0.0005:
+        bull += 2
+        details["pure_alpha_bullish"] = True
+    elif pure_alpha < -0.0005:
+        bear += 2
+        details["pure_alpha_bullish"] = False
+    details["pure_alpha"] = round(pure_alpha, 6)
+
+    # ORB
+    if orb["orb_direction"] == "buy":
+        bull += 3
+        details["orb_breakout"] = "up"
+    elif orb["orb_direction"] == "sell":
+        bear += 3
+        details["orb_breakout"] = "down"
+    else:
+        details["orb_breakout"] = "none"
+    details["orb_strength"] = orb["orb_strength"]
+
+    # News
+    if news_dir == "buy":
+        bull += 2
+        details["news_bullish"] = True
+    elif news_dir == "sell":
+        bear += 2
+        details["news_bullish"] = False
+    details["news_direction"] = news_dir
+    details["bayesian_score"] = round(bayesian_score, 4)
+
+    total = bull + bear
+    if total == 0:
+        direction = "neutral"
+        base_conf = 0.5
+    elif bull > bear:
+        direction = "buy"
+        base_conf = bull / total
+    else:
+        direction = "sell"
+        base_conf = bear / total
+
+    vol_penalty = min(neut_vol / 2.0, 0.15)
+    confidence  = round(max(0.5, min(base_conf - vol_penalty, 0.95)), 4)
+
+    raw_data = {
+        **details,
+        "current_price": float(prices[-1]),
+        "kelly_fraction": round(kelly_fraction, 4),
+        "win_rate": round(win_rate, 4),
+        "neutralized_vol": round(neut_vol, 4),
+        "d_value": features["d_value"],
+        "bull_factors": bull,
+        "bear_factors": bear,
+        "regime": regime_state,
+    }
+
+    print(f"[SOVEREIGN] {symbol}: {direction.upper()} @ {confidence:.2%} | AFD={afd_mom:.5f} | ORB={orb['orb_direction']} | Kelly={kelly_fraction:.2%}")
+
+    return {
+        "symbol": symbol,
+        "direction": direction,
+        "confidence": confidence,
+        "signal_type": "afd_orb_sovereign",
+        "raw_data": raw_data,
+    }
+
+
+def _neutral(symbol: str) -> dict:
+    return {"symbol": symbol, "direction": "neutral", "confidence": 0.5,
+            "signal_type": "insufficient_data", "raw_data": {}}
+
+
+def log_signal(result: dict, regime_state: str = "trend"):
+    if not USER_ID:
+        return
+    record = {
+        "symbol": result["symbol"],
+        "bot": "sovereign",
+        "direction": result["direction"],
+        "confidence": result["confidence"],
+        "signal_type": result["signal_type"],
+        "regime_state": regime_state,
+        "afd_momentum": result["raw_data"].get("afd_momentum"),
+        "raw_data": result["raw_data"],
+        "user_id": USER_ID,
+    }
+    try:
+        supabase.table("signals").insert(record).execute()
+    except Exception as e:
+        print(f"[SOVEREIGN] Supabase error: {e}")
+
+
+def run(symbols: list, regime_state: str = "trend") -> list:
+    results = []
+    for symbol in symbols:
+        result = analyze(symbol, regime_state)
+        log_signal(result, regime_state)
+        results.append(result)
+    return results
+
+
+if __name__ == "__main__":
+    test = ["NVDA", "PLTR", "JPM"]
+    for r in run(test):
+        print(r)
