@@ -39,11 +39,72 @@ data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 
 ET = pytz.timezone("America/New_York")
 
-# Barrier thresholds
-UPPER_BARRIER_PCT = 0.04   # +4% take profit
-LOWER_BARRIER_PCT = 0.02   # -2% stop loss
+# Barrier thresholds (fallback — dynamic ATR barriers override these)
+UPPER_BARRIER_PCT = 0.04   # +4% take profit (fallback)
+LOWER_BARRIER_PCT = 0.02   # -2% stop loss (fallback)
 VERTICAL_HOUR     = 15     # 3:45 PM ET
 VERTICAL_MINUTE   = 45
+
+# ATR-based dynamic barrier multipliers (Lopez de Prado style)
+ATR_TAKE_MULT = 1.5   # take profit = entry ± 1.5 * daily ATR
+ATR_STOP_MULT = 0.75  # stop loss   = entry ± 0.75 * daily ATR (preserves 2:1 R/R)
+
+
+def compute_atr_barriers(symbol: str, entry_time: datetime) -> dict:
+    """
+    Compute volatility-adjusted Triple Barrier thresholds using 20-day ATR.
+    Returns {'upper_pct': float, 'lower_pct': float, 'atr': float}.
+    Falls back to fixed barriers if data unavailable.
+    """
+    try:
+        end = entry_time.astimezone(timezone.utc)
+        start = end - timedelta(days=40)  # fetch extra for ATR warmup
+        alpaca_sym = "TSM" if symbol == "TSMC" else symbol
+        req = StockBarsRequest(
+            symbol_or_symbols=alpaca_sym,
+            timeframe=TimeFrame.Day,
+            start=start, end=end,
+            feed=DataFeed.IEX,
+        )
+        bars = data_client.get_stock_bars(req)
+        df = bars.df
+        if isinstance(df.index, pd.MultiIndex):
+            df = df.xs(alpaca_sym, level=0)
+        df = df.sort_index()
+
+        if len(df) < 15:
+            return {"upper_pct": UPPER_BARRIER_PCT, "lower_pct": LOWER_BARRIER_PCT, "atr": 0.0}
+
+        # True Range = max(H-L, |H-Cprev|, |L-Cprev|)
+        high = df["high"].values
+        low  = df["low"].values
+        close_prev = np.roll(df["close"].values, 1)
+        close_prev[0] = df["close"].values[0]
+
+        tr = np.maximum(
+            high - low,
+            np.maximum(np.abs(high - close_prev), np.abs(low - close_prev))
+        )
+        atr_20 = float(np.mean(tr[-20:]))  # 20-day ATR in dollar terms
+        last_close = float(df["close"].iloc[-1])
+
+        if last_close <= 0 or atr_20 <= 0:
+            return {"upper_pct": UPPER_BARRIER_PCT, "lower_pct": LOWER_BARRIER_PCT, "atr": 0.0}
+
+        # Convert ATR to percentage of price
+        atr_pct = atr_20 / last_close
+        upper = round(atr_pct * ATR_TAKE_MULT, 6)
+        lower = round(atr_pct * ATR_STOP_MULT, 6)
+
+        # Sanity clamps: never wider than 8% or tighter than 0.5%
+        upper = max(0.005, min(upper, 0.08))
+        lower = max(0.003, min(lower, 0.04))
+
+        return {"upper_pct": upper, "lower_pct": lower, "atr": round(atr_pct, 6)}
+
+    except Exception as e:
+        print(f"[LABELER] ATR compute error for {symbol}: {e}")
+        return {"upper_pct": UPPER_BARRIER_PCT, "lower_pct": LOWER_BARRIER_PCT, "atr": 0.0}
 
 
 def get_intraday_bars(symbol: str, date: datetime) -> Optional[pd.DataFrame]:
@@ -75,7 +136,7 @@ def label_trade(
     side: str,
 ) -> dict:
     """
-    Apply Triple Barrier Labeling to a single trade.
+    Apply Triple Barrier Labeling with ATR-based dynamic barriers.
 
     Returns:
       - tbl_label: 1 (win), -1 (loss), 0 (time stop)
@@ -84,18 +145,26 @@ def label_trade(
       - exit_time: timestamp of barrier hit
       - max_favorable: maximum favorable excursion (%)
       - max_adverse: maximum adverse excursion (%)
+      - sample_weight: higher for fast wins, lower for slow time-stops
+      - upper_barrier_pct / lower_barrier_pct: actual thresholds used
     """
     trade_date = entry_time.astimezone(ET)
     df = get_intraday_bars(symbol, trade_date)
 
     if df is None or len(df) < 10:
-        return {"tbl_label": 0, "barrier_hit": "no_data", "exit_price": entry_price}
+        return {"tbl_label": 0, "barrier_hit": "no_data", "exit_price": entry_price, "sample_weight": 0.1}
 
     # Filter to bars after entry
     entry_utc = entry_time.astimezone(timezone.utc) if entry_time.tzinfo else entry_time.replace(tzinfo=timezone.utc)
     df_after = df[df.index >= entry_utc]
     if len(df_after) == 0:
-        return {"tbl_label": 0, "barrier_hit": "no_bars_after_entry", "exit_price": entry_price}
+        return {"tbl_label": 0, "barrier_hit": "no_bars_after_entry", "exit_price": entry_price, "sample_weight": 0.1}
+
+    # Dynamic ATR barriers (per-symbol, per-trade)
+    barriers = compute_atr_barriers(symbol, entry_time)
+    upper_pct = barriers["upper_pct"]
+    lower_pct = barriers["lower_pct"]
+    atr_pct   = barriers["atr"]
 
     # Vertical barrier: 3:45 PM ET
     vertical_time = trade_date.replace(hour=VERTICAL_HOUR, minute=VERTICAL_MINUTE, second=0)
@@ -103,8 +172,9 @@ def label_trade(
 
     max_favorable = 0.0
     max_adverse = 0.0
+    total_bars = len(df_after)
 
-    for idx, row in df_after.iterrows():
+    for bar_idx, (idx, row) in enumerate(df_after.iterrows()):
         current_price = float(row["close"])
         bar_time = idx.to_pydatetime() if hasattr(idx, 'to_pydatetime') else idx
 
@@ -116,8 +186,14 @@ def label_trade(
         max_favorable = max(max_favorable, pct_change)
         max_adverse = min(max_adverse, pct_change)
 
-        # Upper barrier (take profit)
-        if pct_change >= UPPER_BARRIER_PCT:
+        bars_elapsed = bar_idx + 1
+
+        # Upper barrier (take profit) — ATR-scaled
+        if pct_change >= upper_pct:
+            # Sample weight: fast wins weighted higher (inverse of time to exit)
+            speed_factor = max(0.2, 1.0 - (bars_elapsed / max(total_bars, 1)))
+            magnitude_factor = min(abs(pct_change) / 0.02, 3.0)  # scale by return magnitude
+            weight = round(speed_factor * magnitude_factor, 4)
             return {
                 "tbl_label": 1,
                 "barrier_hit": "upper",
@@ -125,11 +201,18 @@ def label_trade(
                 "exit_time": str(bar_time),
                 "max_favorable": round(max_favorable, 6),
                 "max_adverse": round(max_adverse, 6),
-                "bars_to_exit": len(df_after.loc[:idx]),
+                "bars_to_exit": bars_elapsed,
+                "sample_weight": weight,
+                "upper_barrier_pct": upper_pct,
+                "lower_barrier_pct": lower_pct,
+                "atr_pct": atr_pct,
             }
 
-        # Lower barrier (stop loss)
-        if pct_change <= -LOWER_BARRIER_PCT:
+        # Lower barrier (stop loss) — ATR-scaled
+        if pct_change <= -lower_pct:
+            speed_factor = max(0.2, 1.0 - (bars_elapsed / max(total_bars, 1)))
+            magnitude_factor = min(abs(pct_change) / 0.02, 3.0)
+            weight = round(speed_factor * magnitude_factor, 4)
             return {
                 "tbl_label": -1,
                 "barrier_hit": "lower",
@@ -137,7 +220,11 @@ def label_trade(
                 "exit_time": str(bar_time),
                 "max_favorable": round(max_favorable, 6),
                 "max_adverse": round(max_adverse, 6),
-                "bars_to_exit": len(df_after.loc[:idx]),
+                "bars_to_exit": bars_elapsed,
+                "sample_weight": weight,
+                "upper_barrier_pct": upper_pct,
+                "lower_barrier_pct": lower_pct,
+                "atr_pct": atr_pct,
             }
 
         # Vertical barrier (time stop)
@@ -147,6 +234,7 @@ def label_trade(
             bar_et = bar_time
         if hasattr(bar_et, 'hour') and (bar_et.hour > VERTICAL_HOUR or
             (bar_et.hour == VERTICAL_HOUR and bar_et.minute >= VERTICAL_MINUTE)):
+            # Time stops get low weight — they teach the model nothing
             return {
                 "tbl_label": 0,
                 "barrier_hit": "vertical",
@@ -154,7 +242,11 @@ def label_trade(
                 "exit_time": str(bar_time),
                 "max_favorable": round(max_favorable, 6),
                 "max_adverse": round(max_adverse, 6),
-                "bars_to_exit": len(df_after.loc[:idx]),
+                "bars_to_exit": bars_elapsed,
+                "sample_weight": 0.25,
+                "upper_barrier_pct": upper_pct,
+                "lower_barrier_pct": lower_pct,
+                "atr_pct": atr_pct,
             }
 
     # End of data without hitting any barrier
@@ -165,6 +257,10 @@ def label_trade(
         "exit_price": round(last_price, 4),
         "max_favorable": round(max_favorable, 6),
         "max_adverse": round(max_adverse, 6),
+        "sample_weight": 0.2,
+        "upper_barrier_pct": upper_pct,
+        "lower_barrier_pct": lower_pct,
+        "atr_pct": atr_pct,
     }
 
 
@@ -214,8 +310,10 @@ def run_nightly_labeling():
         )
 
         label_str = {1: "WIN", -1: "LOSS", 0: "TIME_STOP"}.get(label_result["tbl_label"], "UNKNOWN")
+        atr_info = f" ATR={label_result.get('atr_pct', 0):.3%}" if label_result.get('atr_pct') else ""
         print(f"[LABELER] {trade['symbol']}: {label_str} via {label_result['barrier_hit']} "
-              f"(MFE={label_result.get('max_favorable', 0):.2%}, MAE={label_result.get('max_adverse', 0):.2%})")
+              f"(MFE={label_result.get('max_favorable', 0):.2%}, MAE={label_result.get('max_adverse', 0):.2%}, "
+              f"w={label_result.get('sample_weight', 0):.2f}{atr_info})")
 
         try:
             supabase.table("trades").update({

@@ -238,13 +238,34 @@ def get_news_sentiment(symbol: str) -> tuple:
 
 # ── Kelly Criterion ───────────────────────────────────────────────────────────
 
-def compute_kelly(win_rate: float, avg_win: float, avg_loss: float) -> float:
+def compute_kelly(win_rate: float, avg_win: float, avg_loss: float,
+                   returns: Optional[np.ndarray] = None) -> float:
+    """
+    Half-Kelly with kurtosis penalty (institutional-grade sizing).
+
+    Standard Kelly assumes normal returns. Real markets have fat tails (kurtosis > 3).
+    We scale down by 1/sqrt(kurtosis/3) so assets with violent gaps get smaller positions.
+    Then apply Half-Kelly on top (industry standard for drawdown control).
+    """
     if avg_loss == 0:
         return 0.005  # floor at 0.5%
     b = avg_win / avg_loss
     q = 1 - win_rate
     kelly = (b * win_rate - q) / b
-    return max(0.005, min(kelly * 0.5, 0.25))  # floor 0.5%, cap 25%
+
+    # Half-Kelly: industry standard to reduce max drawdown by ~50%
+    half_kelly = kelly * 0.5
+
+    # Kurtosis penalty: penalize fat-tailed assets
+    if returns is not None and len(returns) >= 20:
+        kurt = float(pd.Series(returns).kurtosis())  # excess kurtosis (normal = 0)
+        # Convert to raw kurtosis (normal = 3), clamp to avoid division issues
+        raw_kurt = max(kurt + 3.0, 3.0)
+        # Scale factor: 1.0 for normal, <1.0 for fat tails
+        kurt_penalty = min(1.0, np.sqrt(3.0 / raw_kurt))
+        half_kelly *= kurt_penalty
+
+    return max(0.005, min(half_kelly, 0.25))  # floor 0.5%, cap 25%
 
 
 # ── Main Analysis ─────────────────────────────────────────────────────────────
@@ -289,7 +310,8 @@ def analyze(symbol: str, regime_state: str = "trend") -> dict:
     win_rate  = len(wins) / len(returns_5d) if len(returns_5d) > 0 else 0.5
     avg_win   = float(np.mean(wins))   if len(wins)   > 0 else 0.01
     avg_loss  = float(abs(np.mean(losses))) if len(losses) > 0 else 0.01
-    kelly_fraction = compute_kelly(win_rate, avg_win, avg_loss)
+    daily_returns = np.diff(prices) / prices[:-1]  # for kurtosis penalty
+    kelly_fraction = compute_kelly(win_rate, avg_win, avg_loss, returns=daily_returns)
 
     # ── Stockformer Conviction (V3) ─────────────────────────
     sf_scores = stockformer_predict({})

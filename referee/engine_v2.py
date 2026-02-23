@@ -48,7 +48,7 @@ from quant.meta_model import compute_ensemble_score
 from quant.stockformer import predict as stockformer_predict, SEQ_LEN, N_FEATURES, retrain_stockformer
 from quant.feature_factory import build_features
 from referee.net_guard import is_online, with_retry
-from quant.labeler import run_nightly_labeling
+from quant.labeler import run_nightly_labeling, compute_atr_barriers
 
 load_dotenv()
 
@@ -236,29 +236,48 @@ def _alpaca_sym(symbol: str) -> str:
     return ALPACA_TICKER.get(symbol, symbol)
 
 
-def get_mid_price(symbol: str) -> float:
+def get_micro_price(symbol: str) -> tuple:
+    """
+    Stoikov Micro-Price (2018): weights the midpoint by volume imbalance.
+    If bid_size >> ask_size, true price is closer to the ask (buyers aggressive).
+    Returns (micro_price, bid, ask, bid_size, ask_size).
+    """
     asym = _alpaca_sym(symbol)
     try:
         req   = StockLatestQuoteRequest(symbol_or_symbols=asym, feed=DataFeed.IEX)
         quote = data_client.get_stock_latest_quote(req)
-        bid   = float(quote[asym].bid_price or 0)
-        ask   = float(quote[asym].ask_price or 0)
-        if bid > 0 and ask > 0:
-            return (bid + ask) / 2.0
-        return float(quote[asym].ask_price or quote[asym].bid_price or 100.0)
+        bid      = float(quote[asym].bid_price or 0)
+        ask      = float(quote[asym].ask_price or 0)
+        bid_size = float(quote[asym].bid_size or 1)
+        ask_size = float(quote[asym].ask_size or 1)
+
+        if bid > 0 and ask > 0 and bid < ask:
+            # Stoikov micro-price: P_micro = bid + (bid_size / (bid_size + ask_size)) * (ask - bid)
+            imbalance = bid_size / (bid_size + ask_size)
+            micro = bid + imbalance * (ask - bid)
+            return round(micro, 4), bid, ask, bid_size, ask_size
+
+        mid = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else float(quote[asym].ask_price or quote[asym].bid_price or 100.0)
+        return mid, bid, ask, bid_size, ask_size
     except Exception:
-        return 100.0
+        return 100.0, 0, 0, 0, 0
+
+
+def get_mid_price(symbol: str) -> float:
+    """Legacy wrapper — returns just the micro-price scalar."""
+    micro, _, _, _, _ = get_micro_price(symbol)
+    return micro
 
 
 def compute_qty(symbol: str, kelly_fraction: float, equity: float, is_strong: bool) -> tuple:
-    """Returns (qty, mid_price, limit_price). qty is always a whole int."""
-    mid = get_mid_price(symbol)
+    """Returns (qty, micro_price, bid, ask, bid_size, ask_size). qty is always a whole int."""
+    micro, bid, ask, bid_size, ask_size = get_micro_price(symbol)
     size_mult  = 1.0 if is_strong else 0.6
     kelly_boost = min(kelly_fraction * 2, MAX_RISK_PCT - BASE_RISK_PCT)
     risk_pct   = min(BASE_RISK_PCT + kelly_boost, MAX_RISK_PCT) * size_mult
     position_value = equity * risk_pct
-    qty = max(int(position_value / mid), 1)   # int() here — never a float
-    return qty, mid, mid
+    qty = max(int(position_value / micro), 1)   # int() here — never a float
+    return qty, micro, bid, ask, bid_size, ask_size
 
 
 def get_existing_position_qty(symbol: str) -> float:
@@ -612,17 +631,36 @@ def _place_bracket_orders(symbol: str, side: str, filled_price: float, qty: int,
     After a position fills, submit GTC stop-limit + GTC take-profit on Alpaca's servers.
     These execute even when the laptop is offline.
 
+    V4 UPGRADE: ATR-based dynamic brackets (Lopez de Prado / institutional standard).
+    Stop = 0.75 * 20-day ATR, Take = 1.5 * 20-day ATR (preserves 2:1 R/R).
+    Falls back to fixed regime stops if ATR unavailable.
+
     Stop leg: StopLimitOrderRequest
       - stop_price  = entry ± stop_pct  (trigger level)
       - limit_price = stop_price ± 0.3% buffer (execution limit, avoids immediate trigger)
     Take leg: LimitOrderRequest at take_price (GTC)
     """
-    stops = REGIME_STOPS.get(regime, REGIME_STOPS["trend"])
-    stop_pct = stops["stop"]
-    take_pct = stops["take"]
+    if regime == "crisis":
+        return  # Crisis regime — no bracket
+
+    # ATR-based dynamic barriers (per-symbol volatility)
+    try:
+        barriers = compute_atr_barriers(symbol, datetime.now(timezone.utc))
+        stop_pct = barriers["lower_pct"]
+        take_pct = barriers["upper_pct"]
+        atr_pct  = barriers["atr"]
+        # If ATR returned valid data, use it; otherwise fall back to regime stops
+        if atr_pct > 0:
+            print(f"[BRACKET] {symbol}: ATR={atr_pct:.3%} → stop={stop_pct:.2%} take={take_pct:.2%}")
+        else:
+            raise ValueError("ATR unavailable")
+    except Exception:
+        stops = REGIME_STOPS.get(regime, REGIME_STOPS["trend"])
+        stop_pct = stops["stop"]
+        take_pct = stops["take"]
 
     if stop_pct == 0.0:
-        return  # Crisis regime — no bracket
+        return
 
     # 0.3% execution buffer so the limit doesn't trigger on normal intraday noise
     STOP_LIMIT_BUFFER = 0.003
@@ -631,16 +669,16 @@ def _place_bracket_orders(symbol: str, side: str, filled_price: float, qty: int,
     try:
         if side == "buy":
             stop_trigger = round(filled_price * (1 - stop_pct), 2)
-            stop_limit   = round(stop_trigger * (1 - STOP_LIMIT_BUFFER), 2)  # slightly below trigger
+            stop_limit   = round(stop_trigger * (1 - STOP_LIMIT_BUFFER), 2)
             take_price   = round(filled_price * (1 + take_pct), 2)
             exit_side    = OrderSide.SELL
         else:
             stop_trigger = round(filled_price * (1 + stop_pct), 2)
-            stop_limit   = round(stop_trigger * (1 + STOP_LIMIT_BUFFER), 2)  # slightly above trigger
+            stop_limit   = round(stop_trigger * (1 + STOP_LIMIT_BUFFER), 2)
             take_price   = round(filled_price * (1 - take_pct), 2)
             exit_side    = OrderSide.BUY
 
-        # Stop leg: proper StopLimitOrderRequest — only triggers when price crosses stop_trigger
+        # Stop leg: proper StopLimitOrderRequest
         stop_req = StopLimitOrderRequest(
             symbol=asym,
             qty=qty,
@@ -659,7 +697,7 @@ def _place_bracket_orders(symbol: str, side: str, filled_price: float, qty: int,
         )
         trading_client.submit_order(stop_req)
         trading_client.submit_order(take_req)
-        print(f"[BRACKET] {asym}: stop_trigger=${stop_trigger} stop_limit=${stop_limit} ({stop_pct:.1%}) | take=${take_price} ({take_pct:.1%}) | regime={regime}")
+        print(f"[BRACKET] {asym}: stop=${stop_trigger} ({stop_pct:.2%}) | take=${take_price} ({take_pct:.2%}) | regime={regime}")
     except Exception as e:
         print(f"[BRACKET] {asym}: bracket order error — {e}")
 
@@ -676,7 +714,7 @@ def execute_trade(
     regime: str = "trend",
 ) -> Optional[dict]:
 
-    qty, mid_price, _ = compute_qty(symbol, kelly_fraction, equity, is_strong)
+    qty, micro_price, bid, ask, bid_size, ask_size = compute_qty(symbol, kelly_fraction, equity, is_strong)
     qty = max(int(qty), 1)  # CRITICAL: Limit IOC requires whole shares
     order_side = OrderSide.BUY if side == "buy" else OrderSide.SELL
 
@@ -688,14 +726,18 @@ def execute_trade(
             return None
         qty = max(int(min(held, qty)), 1)  # can't sell more than we hold
 
-    # Limit price: mid ± slip% (aggressive enough to fill)
+    # Stoikov Micro-Price execution: place limit at micro-price + small buffer
+    # (micro-price already accounts for bid/ask imbalance, so we need less slip)
+    MICRO_SLIP = 0.0008  # 0.08% — tighter than old 0.15% because micro-price is more accurate
     if side == "buy":
-        limit_price = round(mid_price * (1 + LIMIT_SLIP_PCT), 2)
+        limit_price = round(micro_price * (1 + MICRO_SLIP), 2)
     else:
-        limit_price = round(mid_price * (1 - LIMIT_SLIP_PCT), 2)
+        limit_price = round(micro_price * (1 - MICRO_SLIP), 2)
 
+    mid_price = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else micro_price
     asym = _alpaca_sym(symbol)
     shortfall_bps = round(abs(limit_price - mid_price) / mid_price * 10000, 2)
+    imbalance_str = f"bid_sz={int(bid_size)} ask_sz={int(ask_size)} micro=${micro_price:.2f}"
 
     try:
         # Strategy: Try IOC first for best execution, fall back to DAY limit

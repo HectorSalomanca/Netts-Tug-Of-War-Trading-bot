@@ -28,6 +28,13 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed
 
+try:
+    from alpaca.data.historical.option import OptionHistoricalDataClient
+    from alpaca.data.requests import OptionChainRequest
+    HAS_OPTIONS = True
+except ImportError:
+    HAS_OPTIONS = False
+
 load_dotenv()
 
 ALPACA_API_KEY    = os.getenv("ALPACA_API_KEY")
@@ -66,13 +73,107 @@ def get_spy_history(days: int = 252) -> Optional[pd.DataFrame]:
         return None
 
 
+# ── GEX (Gamma Exposure) Proxy ────────────────────────────────────────────────
+
+_cached_gex = {"value": 0.0, "ts": None}
+
+def compute_gex_proxy() -> float:
+    """
+    Compute Gamma Exposure proxy for SPY from options chain.
+    Positive GEX = dealers long gamma → mean-reverting (chop).
+    Negative GEX = dealers short gamma → volatility explosion (trend/crisis).
+
+    Returns normalised GEX score in [-1, 1].
+    Uses cached value if <30 min old (options data is slow-moving).
+    """
+    global _cached_gex
+    if _cached_gex["ts"] and (datetime.now(timezone.utc) - _cached_gex["ts"]).total_seconds() < 1800:
+        return _cached_gex["value"]
+
+    if not HAS_OPTIONS:
+        return 0.0
+
+    try:
+        option_client = OptionHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+
+        # Get SPY option chain snapshot (near-term, ATM strikes)
+        from alpaca.data.requests import OptionSnapshotRequest
+        from datetime import date
+        import calendar
+
+        today = date.today()
+        # Find next Friday (weekly expiry)
+        days_until_friday = (4 - today.weekday()) % 7
+        if days_until_friday == 0:
+            days_until_friday = 7
+        next_expiry = today + timedelta(days=days_until_friday)
+
+        # Get SPY price for ATM range
+        spy_req = StockBarsRequest(
+            symbol_or_symbols="SPY", timeframe=TimeFrame.Day,
+            start=datetime.now(timezone.utc) - timedelta(days=5),
+            end=datetime.now(timezone.utc), feed=DataFeed.IEX,
+        )
+        spy_bars = data_client.get_stock_bars(spy_req)
+        spy_df = spy_bars.df
+        if isinstance(spy_df.index, pd.MultiIndex):
+            spy_df = spy_df.xs("SPY", level=0)
+        spy_price = float(spy_df["close"].iloc[-1])
+
+        # Fetch option chain for SPY near ATM
+        strike_lo = spy_price * 0.97
+        strike_hi = spy_price * 1.03
+
+        req = OptionChainRequest(
+            underlying_symbol="SPY",
+            expiration_date=next_expiry,
+            strike_price_gte=strike_lo,
+            strike_price_lte=strike_hi,
+        )
+        chain = option_client.get_option_chain(req)
+
+        # Sum gamma * open_interest * contract_multiplier * spot_price
+        # Calls contribute positive gamma, puts contribute negative gamma
+        net_gex = 0.0
+        count = 0
+        for symbol_key, snapshot in chain.items():
+            greeks = snapshot.greeks if hasattr(snapshot, 'greeks') and snapshot.greeks else None
+            if not greeks or not hasattr(greeks, 'gamma'):
+                continue
+            gamma = float(greeks.gamma or 0)
+            # Determine if call or put from symbol (C or P before strike)
+            is_call = 'C' in str(symbol_key).split('SPY')[-1][:8]
+            oi = float(snapshot.open_interest or 0) if hasattr(snapshot, 'open_interest') else 100
+            # GEX contribution: calls positive, puts negative
+            if is_call:
+                net_gex += gamma * oi * 100 * spy_price
+            else:
+                net_gex -= gamma * oi * 100 * spy_price
+            count += 1
+
+        if count == 0:
+            return 0.0
+
+        # Normalise to [-1, 1] using empirical SPY GEX range (~$5B typical)
+        gex_normalised = float(np.clip(net_gex / 5e9, -1.0, 1.0))
+        _cached_gex["value"] = round(gex_normalised, 4)
+        _cached_gex["ts"] = datetime.now(timezone.utc)
+        print(f"[HMM] GEX proxy: {gex_normalised:+.4f} ({count} contracts, raw=${net_gex/1e6:.1f}M)")
+        return gex_normalised
+
+    except Exception as e:
+        print(f"[HMM] GEX compute error (non-fatal): {e}")
+        return 0.0
+
+
 def build_feature_matrix(df: pd.DataFrame) -> np.ndarray:
     """
-    Four features per day (V3):
+    Five features per day (V4):
       - Realized volatility (20-day rolling std of returns, annualized)
       - 5-day momentum (return over last 5 days)
       - Volatility ratio (VIX proxy): 5-day vol / 20-day vol
       - Momentum acceleration: 5-day mom minus 20-day mom
+      - GEX proxy: appended to last row only (real-time options signal)
     """
     closes = df["close"].values
     returns = np.diff(closes) / closes[:-1]
@@ -92,8 +193,13 @@ def build_feature_matrix(df: pd.DataFrame) -> np.ndarray:
         vix_proxy = vol_5 / vol_20 if vol_20 > 0 else 1.0
         # Momentum acceleration
         mom_accel = mom_5 - mom_20
+        # GEX: 0 for historical rows (we only have real-time GEX)
+        features.append([vol_20, mom_5, vix_proxy, mom_accel, 0.0])
 
-        features.append([vol_20, mom_5, vix_proxy, mom_accel])
+    # Inject live GEX into the last row
+    if features:
+        gex = compute_gex_proxy()
+        features[-1][4] = gex
 
     return np.array(features)
 
