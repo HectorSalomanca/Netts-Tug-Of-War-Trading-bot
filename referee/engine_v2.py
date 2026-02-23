@@ -37,6 +37,8 @@ from quant import regime_hmm
 from quant.earnings_filter import filter_watchlist
 from quant.correlation_guard import filter_by_correlation
 from quant.regime_hmm import get_latest_regime_full
+from quant.meta_model import compute_ensemble_score
+from quant.stockformer import predict as stockformer_predict
 
 load_dotenv()
 
@@ -71,9 +73,11 @@ LIMIT_SLIP_PCT      = 0.0005   # limit price = mid ± 0.05% (aggressive, fills l
 
 # ── Regime-adjusted stops ─────────────────────────────────────────────────────
 REGIME_STOPS = {
-    "trend":  {"stop": 0.02, "take": 0.04},
-    "chop":   {"stop": 0.01, "take": 0.02},
-    "crisis": {"stop": 0.00, "take": 0.00},   # crisis = no new trades
+    "trend":       {"stop": 0.02,  "take": 0.04},
+    "trend_bull":  {"stop": 0.025, "take": 0.05},  # V3: wider stops in bull
+    "trend_bear":  {"stop": 0.015, "take": 0.03},  # V3: tighter in bear
+    "chop":        {"stop": 0.01,  "take": 0.02},
+    "crisis":      {"stop": 0.00,  "take": 0.00},
 }
 
 ET = pytz.timezone("America/New_York")
@@ -545,18 +549,37 @@ def run_cycle():
             executed += 1
             held_symbols.append(symbol)
 
+    # V3: Compute ensemble meta-model scores for logging
+    sf_scores = stockformer_predict({})
+    for symbol in safe_symbols:
+        sf = sf_scores.get(symbol, 0.0)
+        m_result = m_map.get(symbol)
+        ofi_z = m_result["raw_data"].get("ofi_z_score", 0.0) if m_result else 0.0
+        iceberg = m_result["raw_data"].get("iceberg_detected", False) if m_result else False
+        stacked = m_result["raw_data"].get("stacked_imbalance", False) if m_result else False
+        trapped = m_result["raw_data"].get("trapped_exhaustion", False) if m_result else False
+        regime_data_full = get_latest_regime_full()
+        ens = compute_ensemble_score(
+            stockformer_score=sf, ofi_z=ofi_z, iceberg=iceberg,
+            stacked=stacked, trapped=trapped,
+            regime=regime, regime_confidence=crisis_conf,
+            state_v3=regime_data_full.get("state_v3", ""),
+        )
+        if ens["ensemble_direction"] != "neutral":
+            print(f"[META] {symbol}: {ens['ensemble_direction'].upper()} score={ens['ensemble_score']:.3f} (SF={ens['stockformer_component']:.3f} OFI={ens['ofi_component']:.3f} HMM={ens['hmm_component']:.3f})")
+
     print(f"\n[REFEREE] Cycle complete — Executed: {executed} | Crowded Skip: {skipped_crowded} | No Signal: {skipped_no_signal} | Regime: {regime.upper()}")
 
 
 # ── Background Tasks ──────────────────────────────────────────────────────────
 
 def _run_scout_background():
-    scout_path = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "scout", "scout_news.py"
-    )
-    subprocess.Popen([sys.executable, scout_path], cwd=os.path.dirname(scout_path))
-    print("[REFEREE] Scout news refresh triggered")
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    scout_news_path = os.path.join(base, "scout", "scout_news.py")
+    scout_alt_path  = os.path.join(base, "scout", "scout_alt.py")
+    subprocess.Popen([sys.executable, scout_news_path], cwd=os.path.join(base, "scout"))
+    subprocess.Popen([sys.executable, scout_alt_path],  cwd=os.path.join(base, "scout"))
+    print("[REFEREE] Scout news + alt data refresh triggered")
 
 
 def _run_hmm_background():

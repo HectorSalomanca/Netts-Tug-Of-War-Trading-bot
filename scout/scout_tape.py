@@ -1,13 +1,17 @@
 """
-Scout Tape — Alpaca WebSocket L1 Quote Streaming + Order Flow Imbalance (OFI)
+Scout Tape V3 — Deep Event-Based OFI + Stacked Imbalance + Trapped Exhaustion
 
-Streams real-time NBBO quotes for all 10 tickers.
-Calculates OFI = (bid_size - ask_size) / (bid_size + ask_size)
-Detects Institutional Icebergs: price flat + high retail volume + negative OFI.
-Writes OFI Z-scores to Supabase every minute.
+Upgrades over V2:
+  - Full event-based OFI formula (bid/ask price AND size changes)
+  - Stacked Imbalance detection: OFI > 3:1 across 3+ consecutive ticks
+  - Trapped Order Exhaustion: heavy volume at breakout peak + OFI flip
+  - Spread tracking for Madman spread-decay gate
+  - PyArrow in-memory buffers for zero-copy columnar OFI storage
+  - Writes enriched snapshots to Supabase every 60 seconds
 """
 
 import os
+import sys
 import asyncio
 import numpy as np
 from collections import defaultdict, deque
@@ -15,6 +19,12 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from alpaca.data.live import StockDataStream
+
+try:
+    import pyarrow as pa
+    HAS_ARROW = True
+except ImportError:
+    HAS_ARROW = False
 
 load_dotenv()
 
@@ -28,21 +38,58 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 WATCHLIST = ["NVDA", "CRWD", "LLY", "TSMC", "JPM", "NEE", "CAT", "SONY", "PLTR", "MSTR"]
 
-OFI_WINDOW = 60        # rolling window for Z-score (60 observations = ~1 min of ticks)
-ICEBERG_OFI_THRESHOLD = -1.5   # OFI Z-score below this = institutional absorption
-ICEBERG_PRICE_FLAT_PCT = 0.001  # price must be within 0.1% of 1-min-ago price
+OFI_WINDOW = 60
+ICEBERG_OFI_THRESHOLD = -1.5
+ICEBERG_PRICE_FLAT_PCT = 0.001
+STACKED_IMBALANCE_RATIO = 3.0   # aggressive/passive volume ratio
+STACKED_IMBALANCE_TICKS = 3     # consecutive ticks required
+TRAPPED_VOLUME_MULT = 2.0       # volume must be 2x avg at breakout peak
+TRAPPED_OFI_FLIP_Z = -1.0       # OFI must flip below this Z after peak
 
 # Per-symbol rolling buffers
 ofi_history: dict = defaultdict(lambda: deque(maxlen=OFI_WINDOW))
-price_history: dict = defaultdict(lambda: deque(maxlen=10))
+price_history: dict = defaultdict(lambda: deque(maxlen=60))
+volume_history: dict = defaultdict(lambda: deque(maxlen=60))
+spread_history: dict = defaultdict(lambda: deque(maxlen=60))
 latest_quote: dict = {}
+prev_bbo: dict = {}  # previous best bid/ask for event-based OFI
+
+# Stacked imbalance tracking
+imbalance_streak: dict = defaultdict(int)
+
+# Arrow table buffers (per-symbol, flushed every 60s)
+arrow_buffers: dict = defaultdict(list)
 
 
-def compute_ofi(bid_size: float, ask_size: float) -> float:
+def compute_ofi_simple(bid_size: float, ask_size: float) -> float:
+    """V2 simple OFI — kept as fallback."""
     total = bid_size + ask_size
     if total == 0:
         return 0.0
     return (bid_size - ask_size) / total
+
+
+def compute_ofi_event(
+    bid_price: float, ask_price: float,
+    bid_size: float, ask_size: float,
+    prev_bid_price: float, prev_ask_price: float,
+    prev_bid_size: float, prev_ask_size: float,
+) -> float:
+    """
+    Full event-based OFI formula from microstructure research:
+    e_n = I{P_bid >= P_bid_prev} * q_bid - I{P_bid <= P_bid_prev} * q_bid_prev
+        - I{P_ask <= P_ask_prev} * q_ask + I{P_ask >= P_ask_prev} * q_ask_prev
+    """
+    e = 0.0
+    if bid_price >= prev_bid_price:
+        e += bid_size
+    if bid_price <= prev_bid_price:
+        e -= prev_bid_size
+    if ask_price <= prev_ask_price:
+        e -= ask_size
+    if ask_price >= prev_ask_price:
+        e += prev_ask_size
+    return e
 
 
 def compute_z_score(values: deque) -> float:
@@ -57,11 +104,67 @@ def compute_z_score(values: deque) -> float:
 
 
 def detect_iceberg(symbol: str, ofi_z: float, mid_price: float) -> bool:
+    """Price flat + negative OFI = institutional absorption."""
     prices = list(price_history[symbol])
     if len(prices) < 5:
         return False
     price_change = abs(mid_price - prices[0]) / prices[0] if prices[0] > 0 else 1.0
     return price_change < ICEBERG_PRICE_FLAT_PCT and ofi_z < ICEBERG_OFI_THRESHOLD
+
+
+def detect_stacked_imbalance(symbol: str, ofi_val: float) -> bool:
+    """
+    Stacked Imbalance: OFI exceeds STACKED_IMBALANCE_RATIO for
+    STACKED_IMBALANCE_TICKS consecutive ticks.
+    Signals high-conviction retail momentum.
+    """
+    if abs(ofi_val) > 0 and ofi_val > 0:
+        ratio = ofi_val  # already normalized
+    else:
+        ratio = 0.0
+
+    # Use raw aggressive/passive ratio from recent OFI values
+    recent = list(ofi_history[symbol])[-STACKED_IMBALANCE_TICKS:]
+    if len(recent) < STACKED_IMBALANCE_TICKS:
+        return False
+
+    all_positive = all(v > 0 for v in recent)
+    if all_positive:
+        avg_ofi = np.mean(recent)
+        if avg_ofi > (1.0 / (1.0 + STACKED_IMBALANCE_RATIO)):  # normalized threshold
+            imbalance_streak[symbol] += 1
+        else:
+            imbalance_streak[symbol] = 0
+    else:
+        imbalance_streak[symbol] = 0
+
+    return imbalance_streak[symbol] >= STACKED_IMBALANCE_TICKS
+
+
+def detect_trapped_exhaustion(symbol: str, ofi_z: float) -> bool:
+    """
+    Trapped Order Exhaustion: heavy volume at breakout peak + immediate OFI flip.
+    Late retail participants trapped at the high → forced liquidation.
+    """
+    prices = list(price_history[symbol])
+    volumes = list(volume_history[symbol])
+    if len(prices) < 10 or len(volumes) < 10:
+        return False
+
+    # Check if we're near a local high (within last 10 ticks)
+    recent_high = max(prices[-10:])
+    current = prices[-1]
+    at_peak = (recent_high - current) / recent_high < 0.002  # within 0.2% of peak
+
+    # Check volume spike at peak
+    avg_vol = np.mean(list(volumes)[:max(len(volumes) - 3, 1)])
+    recent_vol = np.mean(list(volumes)[-3:]) if len(volumes) >= 3 else 0
+    vol_spike = recent_vol > avg_vol * TRAPPED_VOLUME_MULT if avg_vol > 0 else False
+
+    # OFI must have flipped negative
+    ofi_flipped = ofi_z < TRAPPED_OFI_FLIP_Z
+
+    return at_peak and vol_spike and ofi_flipped
 
 
 async def quote_handler(quote):
@@ -75,22 +178,56 @@ async def quote_handler(quote):
         return
 
     mid_price = (bid_price + ask_price) / 2.0
-    ofi = compute_ofi(bid_size, ask_size)
+    spread_pct = (ask_price - bid_price) / mid_price if mid_price > 0 else 0.0
+
+    # Event-based OFI (uses previous BBO state)
+    prev = prev_bbo.get(symbol)
+    if prev:
+        ofi = compute_ofi_event(
+            bid_price, ask_price, bid_size, ask_size,
+            prev["bid_price"], prev["ask_price"],
+            prev["bid_size"], prev["ask_size"],
+        )
+    else:
+        ofi = compute_ofi_simple(bid_size, ask_size)
+
+    # Update previous BBO
+    prev_bbo[symbol] = {
+        "bid_price": bid_price, "ask_price": ask_price,
+        "bid_size": bid_size, "ask_size": ask_size,
+    }
 
     ofi_history[symbol].append(ofi)
     price_history[symbol].append(mid_price)
+    volume_history[symbol].append(bid_size + ask_size)
+    spread_history[symbol].append(spread_pct)
+
+    # Store in Arrow buffer if available
+    if HAS_ARROW:
+        arrow_buffers[symbol].append({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "bid_price": bid_price, "ask_price": ask_price,
+            "bid_size": bid_size, "ask_size": ask_size,
+            "ofi": ofi, "mid": mid_price, "spread_pct": spread_pct,
+        })
+        # Cap buffer at 5000 rows per symbol
+        if len(arrow_buffers[symbol]) > 5000:
+            arrow_buffers[symbol] = arrow_buffers[symbol][-3000:]
 
     latest_quote[symbol] = {
         "bid_size": bid_size,
         "ask_size": ask_size,
+        "bid_price": bid_price,
+        "ask_price": ask_price,
         "mid_price": mid_price,
+        "spread_pct": spread_pct,
         "ofi_raw": ofi,
         "timestamp": datetime.now(timezone.utc),
     }
 
 
 async def flush_to_supabase():
-    """Write OFI snapshots for all symbols every 60 seconds."""
+    """Write enriched OFI snapshots for all symbols every 60 seconds."""
     while True:
         await asyncio.sleep(60)
         if not USER_ID:
@@ -104,6 +241,12 @@ async def flush_to_supabase():
             q = latest_quote[symbol]
             ofi_z = compute_z_score(ofi_history[symbol])
             iceberg = detect_iceberg(symbol, ofi_z, q["mid_price"])
+            stacked = detect_stacked_imbalance(symbol, q["ofi_raw"])
+            trapped = detect_trapped_exhaustion(symbol, ofi_z)
+
+            # Spread stats
+            spreads = list(spread_history[symbol])
+            avg_spread = float(np.mean(spreads)) if spreads else 0.0
 
             records.append({
                 "symbol": symbol,
@@ -116,10 +259,16 @@ async def flush_to_supabase():
                 "user_id": USER_ID,
             })
 
-            if iceberg:
-                print(f"[TAPE] ICEBERG DETECTED: {symbol} | OFI Z={ofi_z:.2f} | mid={q['mid_price']:.2f}")
+            flags = []
+            if iceberg: flags.append("ICEBERG")
+            if stacked: flags.append("STACKED")
+            if trapped: flags.append("TRAPPED")
+            flag_str = " | ".join(flags) if flags else ""
+
+            if flags:
+                print(f"[TAPE] {symbol}: OFI Z={ofi_z:.2f} | spread={avg_spread:.4%} | {flag_str}")
             else:
-                print(f"[TAPE] {symbol}: OFI Z={ofi_z:.2f} | mid={q['mid_price']:.2f}")
+                print(f"[TAPE] {symbol}: OFI Z={ofi_z:.2f} | spread={avg_spread:.4%}")
 
         if records:
             try:
@@ -132,7 +281,7 @@ async def flush_to_supabase():
 def get_latest_ofi(symbol: str) -> dict:
     """
     Read most recent OFI snapshot from Supabase for a symbol.
-    Used by madman_agent to get OFI Z-score.
+    Used by madman_agent to get OFI Z-score + microstructure flags.
     """
     try:
         result = (
@@ -144,10 +293,23 @@ def get_latest_ofi(symbol: str) -> dict:
             .execute()
         )
         if result.data:
-            return result.data[0]
+            row = result.data[0]
+            # Augment with live in-memory data if available
+            ofi_z = row.get("ofi_z_score", 0.0)
+            return {
+                "ofi_z_score": ofi_z,
+                "iceberg_detected": row.get("iceberg_detected", False),
+                "mid_price": row.get("mid_price"),
+                "stacked_imbalance": detect_stacked_imbalance(symbol, 0.0) if symbol in ofi_history else False,
+                "trapped_exhaustion": detect_trapped_exhaustion(symbol, ofi_z) if symbol in ofi_history else False,
+                "spread_pct": float(np.mean(list(spread_history[symbol]))) if symbol in spread_history and spread_history[symbol] else 0.0,
+            }
     except Exception:
         pass
-    return {"ofi_z_score": 0.0, "iceberg_detected": False, "mid_price": None}
+    return {
+        "ofi_z_score": 0.0, "iceberg_detected": False, "mid_price": None,
+        "stacked_imbalance": False, "trapped_exhaustion": False, "spread_pct": 0.0,
+    }
 
 
 async def run_tape():

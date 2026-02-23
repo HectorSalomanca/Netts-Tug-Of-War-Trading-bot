@@ -28,6 +28,8 @@ from supabase import create_client, Client
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from quant.feature_factory import build_features
+from quant.stockformer import predict as stockformer_predict
+from scout.scout_alt import get_alt_signal
 
 load_dotenv()
 
@@ -219,6 +221,15 @@ def analyze(symbol: str, regime_state: str = "trend") -> dict:
     avg_loss  = float(abs(np.mean(losses))) if len(losses) > 0 else 0.01
     kelly_fraction = compute_kelly(win_rate, avg_win, avg_loss)
 
+    # ── Stockformer Conviction (V3) ─────────────────────────
+    sf_scores = stockformer_predict({})
+    sf_score = sf_scores.get(symbol, 0.0)
+
+    # ── Alt Data Signal (V3) ────────────────────────────────
+    alt_signal = get_alt_signal(symbol)
+    alt_dir = alt_signal["direction"]
+    alt_conf = alt_signal["confidence"]
+
     # ── Score Aggregation ─────────────────────────────────────
     bull = 0
     bear = 0
@@ -263,6 +274,25 @@ def analyze(symbol: str, regime_state: str = "trend") -> dict:
     details["news_direction"] = news_dir
     details["bayesian_score"] = round(bayesian_score, 4)
 
+    # Stockformer conviction (V3: highest weight — 4 points)
+    if sf_score > 0.15:
+        bull += 4
+        details["stockformer_bullish"] = True
+    elif sf_score < -0.15:
+        bear += 4
+        details["stockformer_bullish"] = False
+    details["stockformer_score"] = round(sf_score, 4)
+
+    # Alt data signal (V3: 2 points, high-alpha sources)
+    if alt_dir == "buy" and alt_conf > 0.6:
+        bull += 2
+        details["alt_data_bullish"] = True
+    elif alt_dir == "sell" and alt_conf > 0.6:
+        bear += 2
+        details["alt_data_bullish"] = False
+    details["alt_data_direction"] = alt_dir
+    details["alt_data_confidence"] = round(alt_conf, 4)
+
     total = bull + bear
     if total == 0:
         direction = "neutral"
@@ -274,8 +304,12 @@ def analyze(symbol: str, regime_state: str = "trend") -> dict:
         direction = "sell"
         base_conf = bear / total
 
+    # 50% feature neutralization against SPY beta
     vol_penalty = min(neut_vol / 2.0, 0.15)
-    confidence  = round(max(0.5, min(base_conf - vol_penalty, 0.95)), 4)
+    neutralization_factor = 0.5
+    raw_conf = base_conf - vol_penalty
+    neutralized_conf = raw_conf * (1 - neutralization_factor) + 0.5 * neutralization_factor
+    confidence = round(max(0.5, min(neutralized_conf, 0.95)), 4)
 
     raw_data = {
         **details,

@@ -25,6 +25,7 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from quant.ticker_profiles import get_profile, compute_dynamic_pump_threshold, is_spread_too_wide, get_behavior
 
 load_dotenv()
 
@@ -40,7 +41,7 @@ data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 RSI_OVERBOUGHT        = 70
 RSI_OVERSOLD          = 30
 RSI_EXUBERANT         = 85    # extreme retail FOMO
-PUMP_THRESHOLD        = 0.05
+PUMP_THRESHOLD_FLAT   = 0.05  # fallback if no profile data
 VOLUME_SPIKE_MULT     = 2.0
 OFI_FADE_THRESHOLD    = -1.5  # OFI Z below this = institutional absorption → fade retail
 
@@ -104,12 +105,19 @@ def compute_rsi(closes: np.ndarray, period: int = 14) -> float:
     return round(100 - (100 / (1 + rs)), 2)
 
 
-def detect_pump_15min(df_1min: Optional[pd.DataFrame]) -> tuple:
+def detect_pump_15min(df_1min: Optional[pd.DataFrame], symbol: str = "", df_daily: Optional[pd.DataFrame] = None) -> tuple:
     if df_1min is None or len(df_1min) < 15:
         return False, 0.0
     recent = df_1min.tail(15)
     change = (recent["close"].iloc[-1] - recent["close"].iloc[0]) / recent["close"].iloc[0]
-    return change >= PUMP_THRESHOLD, round(change, 4)
+
+    # Dynamic pump threshold based on ticker personality + realized vol
+    if df_daily is not None and len(df_daily) > 20 and symbol:
+        threshold = compute_dynamic_pump_threshold(symbol, df_daily["close"].values)
+    else:
+        threshold = PUMP_THRESHOLD_FLAT
+
+    return change >= threshold, round(change, 4)
 
 
 def detect_volume_spike(df_daily: Optional[pd.DataFrame]) -> tuple:
@@ -139,11 +147,17 @@ def get_ofi(symbol: str) -> dict:
                 datetime.now(timezone.utc) -
                 datetime.fromisoformat(row["created_at"].replace("Z", "+00:00"))
             ).total_seconds()
-            if age < 300:  # only use if < 5 min old
-                return {"ofi_z_score": row["ofi_z_score"], "iceberg": row["iceberg_detected"]}
+            if age < 300:
+                return {
+                    "ofi_z_score": row["ofi_z_score"],
+                    "iceberg": row["iceberg_detected"],
+                    "stacked_imbalance": False,
+                    "trapped_exhaustion": False,
+                    "spread_pct": 0.0,
+                }
     except Exception:
         pass
-    return {"ofi_z_score": 0.0, "iceberg": False}
+    return {"ofi_z_score": 0.0, "iceberg": False, "stacked_imbalance": False, "trapped_exhaustion": False, "spread_pct": 0.0}
 
 
 # ── Retail Sentiment from Supabase ────────────────────────────────────────────
@@ -189,19 +203,32 @@ def analyze(symbol: str, regime_state: str = "trend") -> dict:
     closes_daily = df_daily["close"].values
     rsi = compute_rsi(closes_daily)
 
-    is_pump, pump_pct   = detect_pump_15min(df_1min)
+    is_pump, pump_pct   = detect_pump_15min(df_1min, symbol=symbol, df_daily=df_daily)
     is_vol_spike, vol_ratio = detect_volume_spike(df_daily)
 
     ofi_data    = get_ofi(symbol)
     ofi_z       = ofi_data["ofi_z_score"]
     is_iceberg  = ofi_data["iceberg"]
+    is_stacked  = ofi_data.get("stacked_imbalance", False)
+    is_trapped  = ofi_data.get("trapped_exhaustion", False)
+    spread_pct  = ofi_data.get("spread_pct", 0.0)
 
     sentiment_dir, sentiment_conf = get_retail_sentiment(symbol)
+
+    # Ticker personality
+    profile  = get_profile(symbol)
+    behavior = profile["behavior"]
+
+    # Spread decay gate: if spread too wide, reduce confidence
+    spread_gate = is_spread_too_wide(symbol, spread_pct)
 
     fomo  = 0
     fear  = 0
     details = {"rsi": rsi, "pump_pct": pump_pct, "vol_ratio": vol_ratio,
-               "ofi_z_score": ofi_z, "iceberg_detected": is_iceberg}
+               "ofi_z_score": ofi_z, "iceberg_detected": is_iceberg,
+               "stacked_imbalance": is_stacked, "trapped_exhaustion": is_trapped,
+               "spread_pct": spread_pct, "spread_gate": spread_gate,
+               "ticker_behavior": behavior}
 
     # ── CONTRARIAN FADE (highest priority signal) ─────────────
     # Retail exuberant (RSI > 85) but smart money absorbing (OFI Z < -1.5)
@@ -242,12 +269,34 @@ def analyze(symbol: str, regime_state: str = "trend") -> dict:
     else:
         details["iceberg_signal"] = False
 
-    # ── Retail sentiment ──────────────────────────────────────
+    # ── Stacked Imbalance (V3: high-conviction retail momentum) ──
+    if is_stacked:
+        fomo += 3
+        details["stacked_signal"] = True
+    else:
+        details["stacked_signal"] = False
+
+    # ── Trapped Exhaustion (V3: retail trapped at peak) ────────
+    if is_trapped:
+        fear += 4  # strong mean-reversion signal
+        details["trapped_signal"] = True
+    else:
+        details["trapped_signal"] = False
+
+    # ── Retail sentiment ──────────────────────────────
     if sentiment_dir == "buy":
         fomo += 2
     elif sentiment_dir == "sell":
         fear += 2
     details["retail_sentiment"] = sentiment_dir
+
+    # ── Behavior-adjusted scoring ─────────────────────────
+    # Mean-reversion tickers: boost fear signals (fade retail)
+    # Momentum tickers: boost fomo signals (ride retail)
+    if behavior == "mean_reversion":
+        fear = int(fear * 1.3)
+    elif behavior == "momentum_breakout":
+        fomo = int(fomo * 1.2)
 
     total = fomo + fear
     if total == 0:
@@ -259,6 +308,13 @@ def analyze(symbol: str, regime_state: str = "trend") -> dict:
     else:
         direction  = "sell"
         confidence = round(min(0.5 + (fear / total) * 0.45, 0.95), 4)
+
+    # Spread decay gate: reduce confidence if spread is too wide
+    if spread_gate:
+        confidence = round(max(confidence * 0.7, 0.5), 4)
+        details["spread_penalty"] = True
+    else:
+        details["spread_penalty"] = False
 
     raw_data = {
         **details,

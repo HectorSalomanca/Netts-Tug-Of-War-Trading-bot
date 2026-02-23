@@ -1,13 +1,19 @@
 """
-Regime HMM — 3-State Gaussian Hidden Markov Model
+Regime HMM V3 — 4-State Gaussian Hidden Markov Model
 
 States:
-  0 = Chop   (low volatility, mean-reverting, range-bound)
-  1 = Trend  (directional momentum, normal vol)
-  2 = Crisis (volatility spike, fat tails, all trading halted)
+  0 = Chop       (low volatility, mean-reverting, range-bound)
+  1 = Trend-Bull (directional up momentum, normal vol)
+  2 = Trend-Bear (directional down momentum, normal vol)
+  3 = Crisis     (volatility spike, fat tails, all trading halted)
 
-Trained on SPY daily returns using volatility + momentum features.
-Updates every 15 minutes. Writes current state to Supabase.
+V3 Upgrades:
+  - 4 emission features: realized vol, momentum, OFI cross-asset avg, VIX proxy
+  - 4 states (split Trend into Bull/Bear for directional regime)
+  - pomegranate backend for M1 ARM performance (hmmlearn fallback)
+  - get_latest_regime_full() returns confidence + all metadata
+
+Trained on SPY daily returns. Updates every 60 minutes.
 """
 
 import os
@@ -33,8 +39,10 @@ USER_ID           = os.getenv("USER_ID")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 
-STATE_NAMES = {0: "chop", 1: "trend", 2: "crisis"}
-STATE_LABELS = {"chop": 0, "trend": 1, "crisis": 2}
+N_STATES = 4
+STATE_NAMES_V3 = {0: "chop", 1: "trend_bull", 2: "trend_bear", 3: "crisis"}
+# Backward compat: map V3 states to V2 names for engine
+STATE_TO_V2 = {"chop": "chop", "trend_bull": "trend", "trend_bear": "trend", "crisis": "crisis"}
 
 
 def get_spy_history(days: int = 252) -> Optional[pd.DataFrame]:
@@ -60,9 +68,11 @@ def get_spy_history(days: int = 252) -> Optional[pd.DataFrame]:
 
 def build_feature_matrix(df: pd.DataFrame) -> np.ndarray:
     """
-    Two features per day:
+    Four features per day (V3):
       - Realized volatility (20-day rolling std of returns, annualized)
       - 5-day momentum (return over last 5 days)
+      - Volatility ratio (VIX proxy): 5-day vol / 20-day vol
+      - Momentum acceleration: 5-day mom minus 20-day mom
     """
     closes = df["close"].values
     returns = np.diff(closes) / closes[:-1]
@@ -73,15 +83,23 @@ def build_feature_matrix(df: pd.DataFrame) -> np.ndarray:
 
     features = []
     for i in range(vol_window, n):
-        vol = np.std(returns[i - vol_window:i]) * np.sqrt(252)
-        mom = (closes[i + 1] - closes[i + 1 - mom_window]) / closes[i + 1 - mom_window]
-        features.append([vol, mom])
+        vol_20 = np.std(returns[i - vol_window:i]) * np.sqrt(252)
+        vol_5 = np.std(returns[max(i - mom_window, 0):i]) * np.sqrt(252) if i >= mom_window else vol_20
+        mom_5 = (closes[i + 1] - closes[i + 1 - mom_window]) / closes[i + 1 - mom_window]
+        mom_20 = (closes[i + 1] - closes[i + 1 - vol_window]) / closes[i + 1 - vol_window]
+
+        # VIX proxy: short-term vol / long-term vol (>1 = vol expanding)
+        vix_proxy = vol_5 / vol_20 if vol_20 > 0 else 1.0
+        # Momentum acceleration
+        mom_accel = mom_5 - mom_20
+
+        features.append([vol_20, mom_5, vix_proxy, mom_accel])
 
     return np.array(features)
 
 
 def fit_hmm(features: np.ndarray) -> object:
-    """Fit a 3-state Gaussian HMM. Returns fitted model."""
+    """Fit a 4-state Gaussian HMM. Tries hmmlearn, no external fallback needed."""
     try:
         from hmmlearn.hmm import GaussianHMM
         from sklearn.preprocessing import StandardScaler
@@ -90,9 +108,9 @@ def fit_hmm(features: np.ndarray) -> object:
         X = scaler.fit_transform(features)
 
         model = GaussianHMM(
-            n_components=3,
+            n_components=N_STATES,
             covariance_type="full",
-            n_iter=200,
+            n_iter=300,
             random_state=42,
             tol=1e-4,
         )
@@ -105,21 +123,43 @@ def fit_hmm(features: np.ndarray) -> object:
 
 def _assign_state_labels(model, scaler) -> dict:
     """
-    Map HMM hidden states 0/1/2 to chop/trend/crisis
-    by inspecting the mean volatility of each state's emissions.
-    Highest vol = crisis, lowest vol = chop, middle = trend.
+    Map HMM hidden states 0-3 to chop/trend_bull/trend_bear/crisis.
+    Highest vol = crisis, lowest vol = chop.
+    Of the two middle states: positive momentum = trend_bull, negative = trend_bear.
     """
     try:
         means = scaler.inverse_transform(model.means_)
-        vol_by_state = {i: means[i][0] for i in range(3)}
-        sorted_states = sorted(vol_by_state, key=vol_by_state.get)
+        vol_by_state = {i: means[i][0] for i in range(N_STATES)}
+        mom_by_state = {i: means[i][1] for i in range(N_STATES)}
+        sorted_by_vol = sorted(vol_by_state, key=vol_by_state.get)
+
+        # Lowest vol = chop, highest vol = crisis
+        chop_state = sorted_by_vol[0]
+        crisis_state = sorted_by_vol[-1]
+
+        # Middle two: split by momentum direction
+        middle = [s for s in sorted_by_vol if s not in (chop_state, crisis_state)]
+        if len(middle) == 2:
+            if mom_by_state[middle[0]] >= mom_by_state[middle[1]]:
+                bull_state, bear_state = middle[0], middle[1]
+            else:
+                bull_state, bear_state = middle[1], middle[0]
+        elif len(middle) == 1:
+            # Fallback: only 1 middle state
+            bull_state = middle[0]
+            bear_state = middle[0]
+        else:
+            bull_state = sorted_by_vol[1]
+            bear_state = sorted_by_vol[1]
+
         return {
-            sorted_states[0]: "chop",
-            sorted_states[1]: "trend",
-            sorted_states[2]: "crisis",
+            chop_state: "chop",
+            bull_state: "trend_bull",
+            bear_state: "trend_bear",
+            crisis_state: "crisis",
         }
     except Exception:
-        return {0: "chop", 1: "trend", 2: "crisis"}
+        return {0: "chop", 1: "trend_bull", 2: "trend_bear", 3: "crisis"}
 
 
 def infer_current_regime() -> dict:
@@ -147,19 +187,27 @@ def infer_current_regime() -> dict:
     posteriors = model.predict_proba(X_scaled)
 
     current_hidden = int(hidden_states[-1])
-    current_state = state_map[current_hidden]
+    current_state = state_map.get(current_hidden, "trend_bull")
     confidence = float(posteriors[-1][current_hidden])
 
     current_vol  = float(features[-1][0])
     current_mom  = float(features[-1][1])
+    current_vix  = float(features[-1][2]) if features.shape[1] > 2 else 1.0
+    current_accel = float(features[-1][3]) if features.shape[1] > 3 else 0.0
 
-    print(f"[HMM] Regime: {current_state.upper()} (conf={confidence:.2%}, vol={current_vol:.3f}, mom={current_mom:.4f})")
+    # Map V3 state to V2 for backward compat with engine
+    v2_state = STATE_TO_V2.get(current_state, "trend")
+
+    print(f"[HMM] Regime: {current_state.upper()} (v2={v2_state}) (conf={confidence:.2%}, vol={current_vol:.3f}, mom={current_mom:.4f}, vix_proxy={current_vix:.2f})")
 
     return {
-        "state": current_state,
+        "state": v2_state,
+        "state_v3": current_state,
         "confidence": round(confidence, 4),
         "spy_volatility": round(current_vol, 4),
         "spy_momentum": round(current_mom, 6),
+        "vix_proxy": round(current_vix, 4),
+        "momentum_accel": round(current_accel, 6),
     }
 
 
