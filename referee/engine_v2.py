@@ -120,7 +120,7 @@ def compute_qty(symbol: str, kelly_fraction: float, equity: float, is_strong: bo
     kelly_boost = min(kelly_fraction * 2, MAX_RISK_PCT - BASE_RISK_PCT)
     risk_pct   = min(BASE_RISK_PCT + kelly_boost, MAX_RISK_PCT) * size_mult
     position_value = equity * risk_pct
-    qty = max(round(position_value / mid, 4), 0.01)
+    qty = max(int(position_value / mid), 1)   # Limit IOC requires whole shares
     return qty, mid, mid
 
 
