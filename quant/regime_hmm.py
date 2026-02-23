@@ -195,6 +195,15 @@ def infer_current_regime() -> dict:
     current_vix  = float(features[-1][2]) if features.shape[1] > 2 else 1.0
     current_accel = float(features[-1][3]) if features.shape[1] > 3 else 0.0
 
+    # FIX: Crisis guard — only label as crisis if vol is genuinely elevated
+    # Annualized vol must be >35% (SPY crisis threshold) to call it crisis.
+    # Prevents mislabeling normal trending days as crisis.
+    CRISIS_VOL_FLOOR = 0.35
+    if current_state == "crisis" and current_vol < CRISIS_VOL_FLOOR:
+        # Downgrade to trend_bear (high vol but not crisis-level)
+        current_state = "trend_bear"
+        print(f"[HMM] Crisis downgraded to trend_bear (vol={current_vol:.3f} < {CRISIS_VOL_FLOOR})")
+
     # Map V3 state to V2 for backward compat with engine
     v2_state = STATE_TO_V2.get(current_state, "trend")
 
@@ -238,7 +247,7 @@ def get_latest_regime() -> str:
 
 def get_latest_regime_full() -> dict:
     """
-    Returns full regime dict: {state, confidence, spy_volatility, spy_momentum}.
+    Returns full regime dict: {state, state_v3, confidence, spy_volatility, spy_momentum}.
     Falls back to trend/0.5 defaults if no record found.
     """
     try:
@@ -256,15 +265,24 @@ def get_latest_regime_full() -> dict:
                 datetime.fromisoformat(row["created_at"].replace("Z", "+00:00"))
             ).total_seconds()
             if age_seconds < 1800:
+                state = row["state"]
+                vol = row.get("spy_volatility", 0.0)
+                mom = row.get("spy_momentum", 0.0)
+                # Reconstruct state_v3 from v2 state + momentum direction
+                if state == "trend":
+                    state_v3 = "trend_bull" if mom >= 0 else "trend_bear"
+                else:
+                    state_v3 = state
                 return {
-                    "state":          row["state"],
+                    "state":          state,
+                    "state_v3":       state_v3,
                     "confidence":     row.get("confidence", 0.5),
-                    "spy_volatility": row.get("spy_volatility", 0.0),
-                    "spy_momentum":   row.get("spy_momentum", 0.0),
+                    "spy_volatility": vol,
+                    "spy_momentum":   mom,
                 }
     except Exception:
         pass
-    return {"state": "trend", "confidence": 0.5, "spy_volatility": 0.0, "spy_momentum": 0.0}
+    return {"state": "trend", "state_v3": "trend_bull", "confidence": 0.5, "spy_volatility": 0.0, "spy_momentum": 0.0}
 
 
 def run_and_log() -> dict:

@@ -194,6 +194,26 @@ def is_market_open() -> bool:
     return open_ <= now_et <= close_
 
 
+def is_high_noise_window() -> bool:
+    """
+    Return True during high-noise windows where new entries should be skipped:
+      - First 30 min after open (9:30-10:00 ET): wide spreads, erratic price action
+      - Last 15 min before close (3:45-4:00 ET): EOD positioning noise
+    Exits (stop/take) still run — only new entries are blocked.
+    """
+    now_et = datetime.now(ET)
+    h, m = now_et.hour, now_et.minute
+    # 9:30-10:00 ET
+    if h == 9 and m >= 30:
+        return True
+    if h == 10 and m < 0:  # exactly 10:00 is fine
+        return True
+    # 15:45-16:00 ET
+    if h == 15 and m >= 45:
+        return True
+    return False
+
+
 def get_open_position_count() -> int:
     try:
         return len(trading_client.get_all_positions())
@@ -287,31 +307,30 @@ def _build_stockformer_features() -> dict:
                 if n < SEQ_LEN:
                     continue
 
-                # Build per-day features
+                # Build per-day features (each row = one trading day)
                 feat_arr = np.zeros((n, N_FEATURES))
 
-                # Feature 0: AFD-differenced close (normalized)
-                try:
-                    feats = build_features(closes, spy_c[:n], qqq_c[:n])
-                    afd_val = feats.get("afd_momentum", 0.0)
-                    feat_arr[:, 0] = afd_val  # broadcast scalar
-                except Exception:
-                    pass
+                rets = np.diff(closes, prepend=closes[0]) / (closes + 1e-8)
+
+                # Feature 0: 5-day momentum (rolling, normalized)
+                mom_5 = pd.Series(rets).rolling(5).sum().fillna(0).values
+                mean_m, std_m = np.mean(mom_5), np.std(mom_5) + 1e-8
+                feat_arr[:, 0] = (mom_5 - mean_m) / std_m
 
                 # Feature 1: Volume (log-normalized)
                 log_vol = np.log1p(volumes)
                 mean_v, std_v = np.mean(log_vol), np.std(log_vol) + 1e-8
                 feat_arr[:, 1] = (log_vol - mean_v) / std_v
 
-                # Feature 2: Pure alpha
-                try:
-                    feats = build_features(closes, spy_c[:n], qqq_c[:n])
-                    feat_arr[:, 2] = feats.get("pure_alpha", 0.0)
-                except Exception:
-                    pass
+                # Feature 2: Pure alpha vs SPY (rolling 5-day excess return)
+                if len(spy_c) >= n:
+                    spy_rets = np.diff(spy_c[:n], prepend=spy_c[0]) / (spy_c[:n] + 1e-8)
+                    excess = rets - spy_rets
+                    alpha_5 = pd.Series(excess).rolling(5).sum().fillna(0).values
+                    mean_a, std_a = np.mean(alpha_5), np.std(alpha_5) + 1e-8
+                    feat_arr[:, 2] = (alpha_5 - mean_a) / std_a
 
-                # Feature 3: Realized vol (20-day rolling)
-                rets = np.diff(closes, prepend=closes[0]) / (closes + 1e-8)
+                # Feature 3: Realized vol (20-day rolling, normalized)
                 rv = pd.Series(rets).rolling(20).std().fillna(0).values
                 mean_rv, std_rv = np.mean(rv), np.std(rv) + 1e-8
                 feat_arr[:, 3] = (rv - mean_rv) / std_rv
@@ -374,13 +393,21 @@ def referee_verdict(s: dict, m: dict) -> dict:
         return _result(s, m, False, "no_signal", tug_score)
     if s_dir == "neutral" or s_conf < SOVEREIGN_MIN_CONF:
         return _result(s, m, False, "no_signal", tug_score)
+
+    # Both agree on same direction:
+    # - HIGH confidence from both = strong consensus → EXECUTE
+    # - Low confidence = crowded retail noise → skip
     if s_dir == m_dir:
-        return _result(s, m, False, "crowded_skip", tug_score)
+        if s_conf >= SOVEREIGN_MIN_CONF and m_conf >= 0.65:
+            return _result(s, m, False, "execute", tug_score)  # consensus signal
+        return _result(s, m, False, "crowded_skip", tug_score)  # weak consensus
+
+    # Classic tug: Sovereign vs Madman disagree → institutional edge
     if m_dir != "neutral" and s_dir != m_dir and s_conf >= SOVEREIGN_MIN_CONF:
         return _result(s, m, True, "execute", tug_score)
     if m_dir == "neutral" and s_conf >= SOVEREIGN_SOLO_CONF:
         return _result(s, m, True, "execute", tug_score)
-    return _result(s, m, False, "crowded_skip", tug_score)
+    return _result(s, m, False, "no_signal", tug_score)
 
 
 def _result(s, m, conflict, verdict, tug_score):
@@ -788,6 +815,12 @@ def run_cycle():
     # ── Save last-known-good state for offline cycles ─────────
     _save_cache(regime, crisis_conf, equity)
 
+    # ── Time-of-day filter ────────────────────────────────────
+    if is_high_noise_window():
+        print("[REFEREE] High-noise window (open/close 30min) — exits only, no new entries")
+        position_manager.run_exit_checks({}, {}, regime=regime)
+        return
+
     # ── Earnings filter ───────────────────────────────────────
     safe_symbols, blocked = filter_watchlist(WATCHLIST)
     if blocked:
@@ -847,6 +880,13 @@ def run_cycle():
         s_result = s_map.get(symbol)
         m_result = m_map.get(symbol)
         if not s_result or not m_result:
+            continue
+
+        # FIX: Skip if we already hold this symbol (prevents 18x re-entry)
+        alpaca_sym = _alpaca_sym(symbol)
+        if alpaca_sym in held_symbols or symbol in held_symbols:
+            print(f"[REFEREE] {symbol}: already held — skipping new entry")
+            skipped_no_signal += 1
             continue
 
         verdict   = referee_verdict(s_result, m_result)

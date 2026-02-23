@@ -233,6 +233,24 @@ def analyze(symbol: str, regime_state: str = "trend") -> dict:
     alt_dir = alt_signal["direction"]
     alt_conf = alt_signal["confidence"]
 
+    # ── RSI + MACD from daily bars ────────────────────────────
+    rsi_val = 50.0
+    macd_signal = 0.0
+    try:
+        close_s = pd.Series(prices)
+        delta = close_s.diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = (-delta.clip(upper=0)).rolling(14).mean()
+        rs = gain / (loss + 1e-8)
+        rsi_val = float((100 - 100 / (1 + rs)).iloc[-1])
+        ema12 = close_s.ewm(span=12, adjust=False).mean()
+        ema26 = close_s.ewm(span=26, adjust=False).mean()
+        macd_line = ema12 - ema26
+        macd_sig  = macd_line.ewm(span=9, adjust=False).mean()
+        macd_signal = float(macd_line.iloc[-1] - macd_sig.iloc[-1])  # histogram
+    except Exception:
+        pass
+
     # ── Score Aggregation ─────────────────────────────────────
     bull = 0
     bear = 0
@@ -295,6 +313,28 @@ def analyze(symbol: str, regime_state: str = "trend") -> dict:
         details["alt_data_bullish"] = False
     details["alt_data_direction"] = alt_dir
     details["alt_data_confidence"] = round(alt_conf, 4)
+
+    # RSI (2 points): oversold <35 = bullish, overbought >65 = bearish
+    if rsi_val < 35:
+        bull += 2
+        details["rsi_signal"] = "oversold"
+    elif rsi_val > 65:
+        bear += 2
+        details["rsi_signal"] = "overbought"
+    else:
+        details["rsi_signal"] = "neutral"
+    details["rsi"] = round(rsi_val, 2)
+
+    # MACD histogram (2 points): positive = bullish momentum, negative = bearish
+    if macd_signal > 0:
+        bull += 2
+        details["macd_signal"] = "bullish"
+    elif macd_signal < 0:
+        bear += 2
+        details["macd_signal"] = "bearish"
+    else:
+        details["macd_signal"] = "neutral"
+    details["macd_histogram"] = round(macd_signal, 4)
 
     total = bull + bear
     if total == 0:
