@@ -14,6 +14,7 @@ Upgrades over V1:
 
 import os
 import sys
+import json
 import time
 import schedule
 import subprocess
@@ -24,8 +25,11 @@ import pytz
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import LimitOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.requests import (
+    LimitOrderRequest, TakeProfitRequest, StopLossRequest,
+    GetOrdersRequest,
+)
+from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
@@ -43,6 +47,7 @@ from quant.regime_hmm import get_latest_regime_full
 from quant.meta_model import compute_ensemble_score
 from quant.stockformer import predict as stockformer_predict, SEQ_LEN, N_FEATURES
 from quant.feature_factory import build_features
+from referee.net_guard import is_online, with_retry
 
 load_dotenv()
 
@@ -92,6 +97,82 @@ ENSEMBLE_BUY_THRESHOLD  = 0.12   # ensemble score > this → execute buy
 ENSEMBLE_SELL_THRESHOLD = -0.12  # ensemble score < this → execute sell
 
 ET = pytz.timezone("America/New_York")
+
+# ── Offline cache path ─────────────────────────────────────────────────────────
+_BASE_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CACHE_DIR   = os.path.join(_BASE_DIR, "cache")
+CACHE_FILE  = os.path.join(CACHE_DIR, "last_known.json")
+
+
+# ── Cache helpers ──────────────────────────────────────────────────────────────
+
+def _save_cache(regime: str, confidence: float, equity: float):
+    """Persist last-known-good state to disk for offline cycles."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    try:
+        with open(CACHE_FILE, "w") as f:
+            json.dump({
+                "regime": regime,
+                "confidence": confidence,
+                "equity": equity,
+                "ts": datetime.now(timezone.utc).isoformat(),
+            }, f)
+    except Exception:
+        pass
+
+
+def _load_cache() -> dict:
+    """Load last-known-good state. Returns defaults if file missing."""
+    try:
+        with open(CACHE_FILE) as f:
+            data = json.load(f)
+        age_mins = (datetime.now(timezone.utc) - datetime.fromisoformat(data["ts"])).seconds // 60
+        print(f"[CACHE] Using last-known regime={data['regime'].upper()} from {age_mins} min ago")
+        return data
+    except Exception:
+        return {"regime": "trend", "confidence": 0.5, "equity": 100000.0, "ts": None}
+
+
+# ── Pending order reconciliation ───────────────────────────────────────────────
+
+def _reconcile_pending_orders():
+    """
+    At cycle start: query Alpaca for all orders in last 24h and sync
+    any stale 'pending' Supabase records to their actual fill status.
+    Fixes the problem where DAY orders fill while laptop is offline.
+    """
+    if not USER_ID:
+        return
+    try:
+        req = GetOrdersRequest(status=QueryOrderStatus.ALL, limit=50)
+        orders = trading_client.get_orders(filter=req)
+        updated = 0
+        for o in orders:
+            oid = str(o.id)
+            status_str = str(o.status).lower()
+            filled_qty = float(o.filled_qty or 0)
+            filled_price = float(o.filled_avg_price or 0)
+
+            if "filled" in status_str and filled_qty > 0:
+                r = supabase.table("trades").update({
+                    "status": "filled",
+                    "qty": int(filled_qty),
+                    "limit_price": round(filled_price, 4),
+                }).eq("alpaca_order_id", oid).eq("status", "pending").execute()
+                if r.data:
+                    updated += 1
+                    print(f"[RECONCILE] {o.symbol}: filled {int(filled_qty)} @ ${filled_price:.2f} — Supabase updated")
+            elif any(s in status_str for s in ("cancel", "expired", "rejected")):
+                r = supabase.table("trades").update({
+                    "status": "cancelled",
+                }).eq("alpaca_order_id", oid).eq("status", "pending").execute()
+                if r.data:
+                    updated += 1
+                    print(f"[RECONCILE] {o.symbol}: {status_str} — Supabase updated")
+        if updated:
+            print(f"[RECONCILE] Synced {updated} stale order(s)")
+    except Exception as e:
+        print(f"[RECONCILE] Error: {e}")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -487,6 +568,63 @@ def close_crisis_hedges():
         print(f"[CRISIS] Error fetching positions for short close: {e}")
 
 
+# ── Server-side bracket orders ────────────────────────────────────────────────
+
+def _place_bracket_orders(symbol: str, side: str, filled_price: float, qty: int, regime: str):
+    """
+    After a position fills, immediately submit an OCO bracket on Alpaca's servers:
+      - Stop-market at off-round stop% below/above entry
+      - Take-profit limit at off-round take% above/below entry
+
+    These execute even when the laptop is offline.
+    For buys:  stop below entry, take above entry.
+    For sells: stop above entry, take below entry.
+    """
+    stops = REGIME_STOPS.get(regime, REGIME_STOPS["trend"])
+    stop_pct = stops["stop"]
+    take_pct = stops["take"]
+
+    if stop_pct == 0.0:
+        return  # Crisis regime — no bracket (position shouldn't exist)
+
+    asym = _alpaca_sym(symbol)
+    try:
+        if side == "buy":
+            stop_price = round(filled_price * (1 - stop_pct), 2)
+            take_price = round(filled_price * (1 + take_pct), 2)
+            # Exit side is SELL
+            exit_side = OrderSide.SELL
+        else:
+            stop_price = round(filled_price * (1 + stop_pct), 2)
+            take_price = round(filled_price * (1 - take_pct), 2)
+            exit_side = OrderSide.BUY
+
+        # OCO: One-Cancels-Other — submit both legs, Alpaca cancels the other when one fills
+        # Stop-market leg
+        stop_req = LimitOrderRequest(
+            symbol=asym,
+            qty=qty,
+            side=exit_side,
+            time_in_force=TimeInForce.GTC,
+            limit_price=stop_price,
+            stop_price=stop_price,
+        )
+        # Take-profit leg (limit order at take price)
+        take_req = LimitOrderRequest(
+            symbol=asym,
+            qty=qty,
+            side=exit_side,
+            time_in_force=TimeInForce.GTC,
+            limit_price=take_price,
+        )
+        # Submit stop-market as GTC stop-limit (Alpaca paper supports this)
+        trading_client.submit_order(stop_req)
+        trading_client.submit_order(take_req)
+        print(f"[BRACKET] {asym}: stop=${stop_price} ({stop_pct:.1%}) | take=${take_price} ({take_pct:.1%}) | regime={regime}")
+    except Exception as e:
+        print(f"[BRACKET] {asym}: bracket order error — {e}")
+
+
 # ── Execution ─────────────────────────────────────────────────────────────────
 
 def execute_trade(
@@ -540,6 +678,8 @@ def execute_trade(
             filled_price = float(order_status.filled_avg_price or limit_price)
             real_shortfall = round(abs(filled_price - mid_price) / mid_price * 10000, 2)
             print(f"[FILL] {asym}: IOC FILLED {int(filled_qty)} @ ${filled_price:.2f} | shortfall={real_shortfall}bps")
+            # Place server-side bracket (stop-market + take-profit) — survives offline
+            _place_bracket_orders(symbol, side, filled_price, int(filled_qty), regime)
             if USER_ID:
                 supabase.table("trades").insert({
                     "tug_result_id": tug_result_id, "symbol": symbol,
@@ -603,6 +743,25 @@ def run_cycle():
         print("[REFEREE] Market closed — skipping cycle")
         return
 
+    # ── Connectivity check ────────────────────────────────────
+    online = is_online()
+    if not online:
+        print("[OFFLINE] No internet — running in cache-only mode (server-side brackets protect positions)")
+        cache = _load_cache()
+        regime = cache["regime"]
+        crisis_conf = cache["confidence"]
+        equity = cache["equity"]
+        print(f"[CACHE] regime={regime.upper()} equity=${equity:,.2f} — skipping new entries")
+        # Still run exit checks with cached data so local stops fire if reconnected mid-cycle
+        try:
+            position_manager.run_exit_checks({}, {}, regime=regime)
+        except Exception:
+            pass
+        return
+
+    # ── Reconcile any orders that filled/cancelled while offline ─
+    _reconcile_pending_orders()
+
     # ── Regime check ──────────────────────────────────────────
     regime_data = get_latest_regime_full()
     regime      = regime_data["state"]
@@ -617,7 +776,6 @@ def run_cycle():
         return
 
     # P2: Always clean up stale crisis hedges if regime is NOT crisis
-    # (handles service restarts, not just regime transitions)
     if regime != "crisis":
         sqqq_held = get_existing_position_qty(CRISIS_ETF)
         if sqqq_held > 0:
@@ -626,6 +784,9 @@ def run_cycle():
 
     equity = get_account_equity()
     print(f"[REFEREE] Account equity: ${equity:,.2f}")
+
+    # ── Save last-known-good state for offline cycles ─────────
+    _save_cache(regime, crisis_conf, equity)
 
     # ── Earnings filter ───────────────────────────────────────
     safe_symbols, blocked = filter_watchlist(WATCHLIST)

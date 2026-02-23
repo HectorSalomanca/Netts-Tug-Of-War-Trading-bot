@@ -46,6 +46,9 @@ dashboard/windsurf_deployment.yaml
 # com.tugofwar.trader.plist
 # com.tugofwar.tape.plist
 
+# ── Runtime cache (offline resilience) ───────────────────────
+cache/
+
 # ── Backtest output ───────────────────────────────────────────
 logs/backtest_trades.csv
 

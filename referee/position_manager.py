@@ -26,6 +26,7 @@ from supabase import create_client, Client
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from quant.ticker_profiles import get_behavior
+from referee.net_guard import with_retry
 
 load_dotenv()
 
@@ -62,12 +63,9 @@ TRAILING_STOP_PCT = 0.014  # trail 1.4% below high-water (off-round)
 _high_water_marks = defaultdict(float)  # {symbol: max unrealized_pct seen}
 
 
+@with_retry(max_attempts=3, base_delay=5, default=[], label="get_open_positions")
 def get_open_positions() -> list:
-    try:
-        return trading_client.get_all_positions()
-    except Exception as e:
-        print(f"[POS_MGR] Error fetching positions: {e}")
-        return []
+    return trading_client.get_all_positions()
 
 
 def is_near_close() -> bool:
@@ -78,16 +76,17 @@ def is_near_close() -> bool:
 
 
 def close_position(symbol: str, reason: str, qty: Optional[float] = None):
-    try:
+    @with_retry(max_attempts=3, base_delay=5, default=None, label=f"close_position({symbol})")
+    def _do_close():
         if qty is not None:
             req = ClosePositionRequest(qty=str(int(qty)))
             trading_client.close_position(symbol, close_options=req)
         else:
             trading_client.close_position(symbol)
+    result = _do_close()
+    if result is not None or True:  # always log + update
         print(f"[POS_MGR] CLOSED {symbol} — reason: {reason}")
         _update_trade_record(symbol, reason)
-    except Exception as e:
-        print(f"[POS_MGR] Error closing {symbol}: {e}")
 
 
 def _update_trade_record(symbol: str, exit_reason: str):
