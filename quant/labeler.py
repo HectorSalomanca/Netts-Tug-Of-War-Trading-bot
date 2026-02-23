@@ -18,6 +18,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import pytz
+from dateutil import parser as dateutil_parser
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from alpaca.data.historical import StockHistoricalDataClient
@@ -197,8 +198,11 @@ def run_nightly_labeling():
 
     labeled = 0
     for trade in trades:
-        entry_time = datetime.fromisoformat(trade["created_at"].replace("Z", "+00:00"))
-        entry_price = float(trade.get("limit_price", 0))
+        entry_time = dateutil_parser.parse(trade["created_at"])
+        raw_price = trade.get("limit_price") or trade.get("fill_price")
+        if raw_price is None:
+            continue
+        entry_price = float(raw_price)
         if entry_price <= 0:
             continue
 

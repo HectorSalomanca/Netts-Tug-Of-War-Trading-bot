@@ -100,34 +100,96 @@ _learned_weights = None
 
 def learn_weights_from_history() -> dict:
     """
-    Fit Ridge regression on last 30 days of trade outcomes to learn optimal
-    ensemble weights. Falls back to DEFAULT_WEIGHTS if insufficient data.
+    Fit Ridge regression on labeled trades to learn optimal ensemble weights.
+    Requires tbl_label column in trades table (1=win, -1=loss, 0=time_stop).
+    Falls back to DEFAULT_WEIGHTS if fewer than 20 labeled samples.
     """
     global _learned_weights
 
     try:
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        from sklearn.linear_model import Ridge
+        from sklearn.preprocessing import StandardScaler
+    except ImportError:
+        print("[META] scikit-learn not installed — using default weights")
+        return DEFAULT_WEIGHTS
+
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat()
+
+        # Fetch labeled filled trades with their tug_result_id for component lookup
         result = (
             supabase.table("trades")
-            .select("symbol, side, qty, limit_price, status, created_at")
+            .select("tug_result_id, symbol, side, tbl_label, created_at")
             .gte("created_at", cutoff)
             .eq("status", "filled")
+            .not_.is_("tbl_label", "null")
             .order("created_at", desc=True)
             .limit(200)
             .execute()
         )
 
-        if not result.data or len(result.data) < 20:
-            print("[META] Insufficient trade history for Ridge — using defaults")
+        trades = result.data or []
+        if len(trades) < 20:
+            print(f"[META] Only {len(trades)} labeled trades — need 20+ for Ridge, using defaults")
             return DEFAULT_WEIGHTS
 
-        # For now, use default weights until we have labeled outcomes
-        # (Triple Barrier Labeler will provide tbl_label for proper Ridge fitting)
-        print(f"[META] Found {len(result.data)} trades — Ridge fitting requires TBL labels")
-        return DEFAULT_WEIGHTS
+        # Fetch tug_results for component scores
+        tug_ids = [t["tug_result_id"] for t in trades if t.get("tug_result_id")]
+        if not tug_ids:
+            print("[META] No tug_result_ids found — using defaults")
+            return DEFAULT_WEIGHTS
+
+        tug_result = (
+            supabase.table("tug_results")
+            .select("id, stockformer_score, ofi_score, hmm_score")
+            .in_("id", tug_ids[:100])
+            .execute()
+        )
+        tug_map = {r["id"]: r for r in (tug_result.data or [])}
+
+        X_rows, y_rows = [], []
+        for trade in trades:
+            tid = trade.get("tug_result_id")
+            tug = tug_map.get(tid)
+            if not tug:
+                continue
+            sf  = float(tug.get("stockformer_score") or 0.0)
+            ofi = float(tug.get("ofi_score") or 0.0)
+            hmm = float(tug.get("hmm_score") or 0.0)
+            label = int(trade["tbl_label"])
+            # Convert label: 1=win → +1, -1=loss → -1, 0=time_stop → 0
+            X_rows.append([sf, ofi, hmm])
+            y_rows.append(float(label))
+
+        if len(X_rows) < 20:
+            print(f"[META] Only {len(X_rows)} matched rows — using defaults")
+            return DEFAULT_WEIGHTS
+
+        X = np.array(X_rows)
+        y = np.array(y_rows)
+
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+
+        ridge = Ridge(alpha=1.0, fit_intercept=True)
+        ridge.fit(X_scaled, y)
+
+        raw_coefs = ridge.coef_  # [sf_weight, ofi_weight, hmm_weight]
+
+        # Softmax-normalise to sum=1, all positive
+        exp_coefs = np.exp(np.clip(raw_coefs, -5, 5))
+        weights_arr = exp_coefs / exp_coefs.sum()
+
+        learned = {
+            "stockformer": round(float(weights_arr[0]), 4),
+            "ofi":         round(float(weights_arr[1]), 4),
+            "hmm":         round(float(weights_arr[2]), 4),
+        }
+        print(f"[META] Ridge fitted on {len(X_rows)} samples → weights={learned}")
+        return learned
 
     except Exception as e:
-        print(f"[META] Weight learning error: {e}")
+        print(f"[META] Ridge fitting error: {e} — using defaults")
         return DEFAULT_WEIGHTS
 
 

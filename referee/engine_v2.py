@@ -1051,9 +1051,13 @@ def _run_hmm_background():
 
 
 def _run_labeler_background():
-    """Label any unlabeled filled trades with Triple Barrier outcomes."""
+    """Label any unlabeled filled trades with Triple Barrier outcomes, then refresh Ridge weights."""
     try:
         run_nightly_labeling()
+        # Invalidate cached Ridge weights so meta-model re-fits on next cycle
+        import quant.meta_model as _mm
+        _mm._learned_weights = None
+        print("[REFEREE] Ridge weights invalidated — will re-fit on next cycle")
     except Exception as e:
         print(f"[REFEREE] Labeler error: {e}")
 
