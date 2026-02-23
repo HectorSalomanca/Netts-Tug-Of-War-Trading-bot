@@ -51,9 +51,12 @@ MODEL_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
-WATCHLIST = ["NVDA", "CRWD", "LLY", "TSMC", "JPM", "NEE", "CAT", "SONY", "PLTR", "MSTR"]
+WATCHLIST = [
+    "NVDA", "CRWD", "LLY", "TSMC", "JPM", "NEE", "CAT", "SONY", "PLTR", "MSTR",
+    "MSFT", "AMZN", "META", "GLD", "XLE", "UBER", "AMD", "COIN", "MRNA", "IWM",
+]
 SEQ_LEN      = 60     # 60-day lookback
-N_ASSETS     = 10
+N_ASSETS     = 20
 N_FEATURES   = 4      # afd_close, volume_norm, pure_alpha, realized_vol
 D_MODEL      = 64     # transformer hidden dim
 N_HEADS      = 4
@@ -64,13 +67,24 @@ EPOCHS       = 50
 BATCH_SIZE   = 16
 
 # Lead-lag attention bias (hard-coded from cross-sectional research)
-# Index mapping: NVDA=0, CRWD=1, LLY=2, TSMC=3, JPM=4, NEE=5, CAT=6, SONY=7, PLTR=8, MSTR=9
+# Index mapping:
+#   NVDA=0, CRWD=1, LLY=2, TSMC=3, JPM=4, NEE=5, CAT=6, SONY=7, PLTR=8, MSTR=9
+#   MSFT=10, AMZN=11, META=12, GLD=13, XLE=14, UBER=15, AMD=16, COIN=17, MRNA=18, IWM=19
 LEAD_LAG_PAIRS = {
-    (0, 1): 0.3,   # NVDA → CRWD (tech stack flow)
-    (3, 9): 0.2,   # TSMC → MSTR (macro liquidity)
-    (2, 2): 0.1,   # LLY self-reinforcing (pharma momentum)
-    (0, 3): 0.15,  # NVDA → TSMC (supply chain)
-    (8, 9): 0.1,   # PLTR → MSTR (high-beta correlation)
+    (0, 1):  0.30,  # NVDA → CRWD (tech stack flow)
+    (3, 9):  0.20,  # TSMC → MSTR (macro liquidity)
+    (2, 2):  0.10,  # LLY self-reinforcing (pharma momentum)
+    (0, 3):  0.15,  # NVDA → TSMC (supply chain)
+    (8, 9):  0.10,  # PLTR → MSTR (high-beta correlation)
+    (0, 16): 0.35,  # NVDA → AMD (semiconductor sector)
+    (16, 0): 0.20,  # AMD → NVDA (bidirectional semi)
+    (10, 11):0.15,  # MSFT → AMZN (mega-cap tech rotation)
+    (9, 17): 0.30,  # MSTR → COIN (crypto proxy)
+    (17, 9): 0.25,  # COIN → MSTR (crypto proxy reverse)
+    (13, 14):0.20,  # GLD → XLE (macro risk-off rotation)
+    (19, 4): 0.15,  # IWM → JPM (small-cap risk-on → financials)
+    (12, 15):0.15,  # META → UBER (consumer sentiment)
+    (2, 18): 0.20,  # LLY → MRNA (biotech sector flow)
 }
 
 
@@ -423,6 +437,73 @@ def predict(features_dict: dict) -> dict:
     return result
 
 
+# ── Auto-Retrain Entry Point ─────────────────────────────────────────────────
+
+def retrain_stockformer():
+    """
+    Fetch 180 days of daily bars for all watchlist symbols,
+    build training data, and retrain the Stockformer model.
+    Called automatically every Sunday by the engine scheduler.
+    """
+    if not HAS_TORCH:
+        print("[STOCKFORMER] PyTorch not available — skipping retrain")
+        return
+
+    from alpaca.data.historical import StockHistoricalDataClient
+    from alpaca.data.requests import StockBarsRequest
+    from alpaca.data.timeframe import TimeFrame
+    from alpaca.data.enums import DataFeed
+    from dotenv import load_dotenv
+    import os
+    load_dotenv()
+
+    data_client = StockHistoricalDataClient(
+        os.getenv("ALPACA_API_KEY"), os.getenv("ALPACA_SECRET_KEY")
+    )
+
+    end   = datetime.now(timezone.utc)
+    start = end - timedelta(days=180)
+
+    all_data = {}
+    for sym in WATCHLIST:
+        alpaca_sym = "TSM" if sym == "TSMC" else sym
+        try:
+            req = StockBarsRequest(
+                symbol_or_symbols=alpaca_sym,
+                timeframe=TimeFrame.Day,
+                start=start, end=end,
+                feed=DataFeed.IEX,
+            )
+            bars = data_client.get_stock_bars(req)
+            df = bars.df
+            if isinstance(df.index, pd.MultiIndex):
+                df = df.xs(alpaca_sym, level=0)
+            df = df.sort_index().copy()
+
+            # Compute AFD-close and pure_alpha approximations
+            closes = df["close"].values
+            df["afd_close"] = np.diff(closes, prepend=closes[0]) / (closes + 1e-8)
+            df["pure_alpha"] = df["afd_close"] - df["afd_close"].rolling(20).mean().fillna(0)
+            all_data[sym] = df
+            print(f"[STOCKFORMER RETRAIN] {sym}: {len(df)} days fetched")
+        except Exception as e:
+            print(f"[STOCKFORMER RETRAIN] {sym}: fetch error — {e}")
+
+    if len(all_data) < N_ASSETS:
+        print(f"[STOCKFORMER RETRAIN] Only {len(all_data)}/{N_ASSETS} symbols fetched — aborting")
+        return
+
+    print(f"[STOCKFORMER RETRAIN] Starting training on {N_ASSETS} assets...")
+    model = train_stockformer(all_data)
+    if model is not None:
+        # Invalidate in-memory cache so next predict() loads fresh weights
+        global _cached_model
+        _cached_model = None
+        print("[STOCKFORMER RETRAIN] Complete — new weights saved, cache invalidated")
+    else:
+        print("[STOCKFORMER RETRAIN] Training failed")
+
+
 if __name__ == "__main__":
     print(f"[STOCKFORMER] Device: {DEVICE}")
     print(f"[STOCKFORMER] PyTorch available: {HAS_TORCH}")
@@ -430,7 +511,6 @@ if __name__ == "__main__":
         model = Stockformer()
         total_params = sum(p.numel() for p in model.parameters())
         print(f"[STOCKFORMER] Model params: {total_params:,}")
-        # Test forward pass
         dummy = torch.randn(2, SEQ_LEN, N_ASSETS, N_FEATURES)
         out = model(dummy)
         print(f"[STOCKFORMER] Output shape: {out.shape} (expected [2, {N_ASSETS}])")

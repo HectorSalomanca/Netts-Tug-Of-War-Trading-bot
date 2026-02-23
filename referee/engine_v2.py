@@ -45,7 +45,7 @@ from quant.earnings_filter import filter_watchlist
 from quant.correlation_guard import filter_by_correlation
 from quant.regime_hmm import get_latest_regime_full
 from quant.meta_model import compute_ensemble_score
-from quant.stockformer import predict as stockformer_predict, SEQ_LEN, N_FEATURES
+from quant.stockformer import predict as stockformer_predict, SEQ_LEN, N_FEATURES, retrain_stockformer
 from quant.feature_factory import build_features
 from referee.net_guard import is_online, with_retry
 from quant.labeler import run_nightly_labeling
@@ -64,12 +64,17 @@ trading_client    = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=PAPER
 data_client       = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 
 # ── Watchlist ─────────────────────────────────────────────────────────────────
-WATCHLIST   = ["NVDA", "CRWD", "LLY", "TSMC", "JPM", "NEE", "CAT", "SONY", "PLTR", "MSTR"]
+WATCHLIST   = [
+    "NVDA", "CRWD", "LLY", "TSMC", "JPM", "NEE", "CAT", "SONY", "PLTR", "MSTR",
+    "MSFT", "AMZN", "META", "GLD", "XLE", "UBER", "AMD", "COIN", "MRNA", "IWM",
+]
 BENCHMARKS  = ["SPY", "QQQ"]   # used for neutralization, not traded
 CRISIS_ETF  = "SQQQ"           # 3× inverse QQQ — bought during Crisis
 
 # Alpaca ticker mapping (some symbols differ from our watchlist names)
-ALPACA_TICKER = {"TSMC": "TSM"}  # Taiwan Semiconductor ADR
+ALPACA_TICKER = {
+    "TSMC": "TSM",   # Taiwan Semiconductor ADR
+}
 CRISIS_ETF_RISK_PCT  = 0.03    # 3% equity into SQQQ hedge
 CRISIS_SHORT_RISK_PCT = 0.02   # 2% equity into weakest-symbol short
 CRISIS_CONF_THRESHOLD = 0.90   # only hedge if HMM is ≥90% confident in Crisis
@@ -1053,6 +1058,18 @@ def _run_labeler_background():
         print(f"[REFEREE] Labeler error: {e}")
 
 
+def _run_stockformer_retrain():
+    """Weekly Stockformer retrain — runs Sunday after market close."""
+    now = datetime.now(ET)
+    if now.weekday() != 6:  # 6 = Sunday
+        return
+    print("[REFEREE] Sunday detected — triggering Stockformer weekly retrain")
+    try:
+        retrain_stockformer()
+    except Exception as e:
+        print(f"[REFEREE] Stockformer retrain error: {e}")
+
+
 # ── Schedulers ────────────────────────────────────────────────────────────────
 
 def run_once():
@@ -1070,6 +1087,7 @@ def run_scheduled(interval_minutes: int = 15):
     schedule.every(30).minutes.do(_run_scout_background)
     schedule.every(60).minutes.do(_run_hmm_background)
     schedule.every(4).hours.do(_run_labeler_background)
+    schedule.every(24).hours.do(_run_stockformer_retrain)  # checks day; only fires on Sunday
 
     run_cycle()
     while True:

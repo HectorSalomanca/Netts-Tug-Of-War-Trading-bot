@@ -109,6 +109,71 @@ def get_intraday_bars(symbol: str) -> Optional[pd.DataFrame]:
         return None
 
 
+def get_intraday_5min_bars(symbol: str) -> Optional[pd.DataFrame]:
+    """Fetch today's 5-min bars for VWAP + intraday momentum."""
+    try:
+        now_et = datetime.now(ET)
+        start_et = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+        start_utc = start_et.astimezone(timezone.utc)
+        end_utc = datetime.now(timezone.utc)
+        req = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TimeFrame.Minute5,
+            start=start_utc, end=end_utc,
+            feed=DataFeed.IEX,
+        )
+        bars = data_client.get_stock_bars(req)
+        df = bars.df
+        if isinstance(df.index, pd.MultiIndex):
+            df = df.xs(symbol, level=0)
+        return df.sort_index()
+    except Exception:
+        return None
+
+
+def compute_vwap_signal(df_5min: Optional[pd.DataFrame]) -> dict:
+    """
+    Compute VWAP deviation and intraday momentum from 5-min bars.
+    Returns:
+      - vwap_direction: 'buy' / 'sell' / 'neutral'
+      - vwap_deviation: % above/below VWAP (positive = above)
+      - intraday_momentum: slope of last 12 bars (1 hour) normalised
+    """
+    if df_5min is None or len(df_5min) < 3:
+        return {"vwap_direction": "neutral", "vwap_deviation": 0.0, "intraday_momentum": 0.0}
+
+    try:
+        typical = (df_5min["high"] + df_5min["low"] + df_5min["close"]) / 3
+        cum_vol  = df_5min["volume"].cumsum()
+        cum_tpv  = (typical * df_5min["volume"]).cumsum()
+        vwap     = cum_tpv / (cum_vol + 1e-8)
+
+        current_price = float(df_5min["close"].iloc[-1])
+        current_vwap  = float(vwap.iloc[-1])
+        deviation     = (current_price - current_vwap) / (current_vwap + 1e-8)
+
+        # Intraday momentum: linear slope over last 12 bars (1 hour)
+        lookback = min(12, len(df_5min))
+        recent_closes = df_5min["close"].iloc[-lookback:].values
+        x = np.arange(len(recent_closes))
+        slope = float(np.polyfit(x, recent_closes, 1)[0]) / (recent_closes.mean() + 1e-8)
+
+        if deviation > 0.003:    # >0.3% above VWAP = bullish
+            direction = "buy"
+        elif deviation < -0.003: # >0.3% below VWAP = bearish
+            direction = "sell"
+        else:
+            direction = "neutral"
+
+        return {
+            "vwap_direction": direction,
+            "vwap_deviation": round(deviation, 5),
+            "intraday_momentum": round(slope, 6),
+        }
+    except Exception:
+        return {"vwap_direction": "neutral", "vwap_deviation": 0.0, "intraday_momentum": 0.0}
+
+
 # ── Opening Range Breakout ────────────────────────────────────────────────────
 
 def compute_orb(df_1min: Optional[pd.DataFrame]) -> dict:
@@ -205,9 +270,11 @@ def analyze(symbol: str, regime_state: str = "trend") -> dict:
     pure_alpha = features["pure_alpha"]
     neut_vol  = features["neutralized_vol"]
 
-    # ── ORB ───────────────────────────────────────────────────
+    # ── ORB + VWAP (5-min) ─────────────────────────────────────────
     df_1min = get_intraday_bars(symbol)
     orb = compute_orb(df_1min)
+    df_5min = get_intraday_5min_bars(symbol)
+    vwap_sig = compute_vwap_signal(df_5min)
 
     # ── News Sentiment ────────────────────────────────────────
     news_dir, news_conf, bayesian_score = get_news_sentiment(symbol)
@@ -394,6 +461,27 @@ def analyze(symbol: str, regime_state: str = "trend") -> dict:
     else:
         details["ma20_signal"] = "at_ma"
     details["price_vs_ma20"] = round(price_vs_ma20, 4)
+
+    # VWAP deviation (2 points): price vs intraday VWAP = institutional anchor
+    vwap_dir = vwap_sig["vwap_direction"]
+    if vwap_dir == "buy":
+        bull += 2
+    elif vwap_dir == "sell":
+        bear += 2
+    details["vwap_direction"] = vwap_dir
+    details["vwap_deviation"] = vwap_sig["vwap_deviation"]
+
+    # Intraday momentum (2 points): 1-hour price slope from 5-min bars
+    intra_mom = vwap_sig["intraday_momentum"]
+    if intra_mom > 0.0001:
+        bull += 2
+        details["intraday_momentum_signal"] = "rising"
+    elif intra_mom < -0.0001:
+        bear += 2
+        details["intraday_momentum_signal"] = "falling"
+    else:
+        details["intraday_momentum_signal"] = "flat"
+    details["intraday_momentum"] = round(intra_mom, 6)
 
     total = bull + bear
     if total == 0:
