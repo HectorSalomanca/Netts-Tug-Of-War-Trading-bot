@@ -396,15 +396,50 @@ def load_model() -> Optional[object]:
         return None
 
 
+def _neutralize_predictions(raw_scores: np.ndarray, features: np.ndarray) -> np.ndarray:
+    """
+    Numerai-style Feature Neutralization.
+
+    Regress raw model predictions against input features, then subtract
+    the linear component. This forces the Stockformer to only output
+    non-linear alpha — the hidden relationships it found that simple
+    momentum/vol/OFI can't explain.
+
+    raw_scores: [N_ASSETS] — raw conviction scores from Stockformer
+    features:   [N_ASSETS, N_FEATURES] — last-timestep input features
+
+    Returns: [N_ASSETS] — orthogonalized scores
+    """
+    if features.shape[0] < 3 or np.std(raw_scores) < 1e-8:
+        return raw_scores
+
+    try:
+        # OLS: raw_scores = beta @ features.T + residual
+        X = np.column_stack([np.ones(features.shape[0]), features])
+        beta, _, _, _ = np.linalg.lstsq(X, raw_scores, rcond=None)
+        linear_component = X @ beta
+        residual = raw_scores - linear_component
+
+        # Scale residual back to similar magnitude as raw scores
+        if np.std(residual) > 1e-8:
+            residual = residual * (np.std(raw_scores) / np.std(residual))
+
+        return np.clip(residual, -1.0, 1.0)
+    except Exception:
+        return raw_scores
+
+
 def predict(features_dict: dict) -> dict:
     """
-    Run inference on current market data.
+    Run inference on current market data with Numerai-style feature neutralization.
 
     Args:
         features_dict: {symbol: np.ndarray of shape [SEQ_LEN, N_FEATURES]}
 
     Returns:
         {symbol: conviction_score} where score is in [-1, 1]
+        Scores are orthogonalized against input features to remove
+        linear factor exposure (momentum, vol, etc).
     """
     if not HAS_TORCH:
         return {sym: 0.0 for sym in WATCHLIST}
@@ -428,11 +463,15 @@ def predict(features_dict: dict) -> dict:
 
     model.eval()
     with torch.no_grad():
-        scores = model(x_tensor).cpu().numpy()[0]  # [N_ASSETS]
+        raw_scores = model(x_tensor).cpu().numpy()[0]  # [N_ASSETS]
+
+    # Numerai Feature Neutralization: orthogonalize against last-timestep features
+    last_features = x[0, -1, :, :]  # [N_ASSETS, N_FEATURES]
+    neutralized = _neutralize_predictions(raw_scores, last_features)
 
     result = {}
     for j, sym in enumerate(WATCHLIST):
-        result[sym] = float(np.clip(scores[j], -1.0, 1.0))
+        result[sym] = float(np.clip(neutralized[j], -1.0, 1.0))
 
     return result
 

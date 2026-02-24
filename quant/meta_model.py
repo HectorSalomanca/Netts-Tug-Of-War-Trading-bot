@@ -29,9 +29,10 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 # Default weights (used before Ridge regression has enough data)
 DEFAULT_WEIGHTS = {
-    "stockformer": 0.45,   # highest weight — Transformer conviction
-    "ofi":         0.30,   # OFI regression score
-    "hmm":         0.25,   # HMM regime posterior
+    "stockformer": 0.35,   # Transformer conviction (feature-neutralized)
+    "ofi":         0.25,   # OFI regression score (cross-sectional deviated)
+    "hmm":         0.20,   # HMM regime posterior
+    "alpha":       0.20,   # WorldQuant 101 formulaic alpha composite
 }
 
 NEUTRALIZATION_PCT = 0.0   # Disabled: neutralization was halving all scores (same bug as sovereign)
@@ -213,6 +214,7 @@ def compute_ensemble_score(
     regime_confidence: float,
     state_v3: str = "",
     spy_beta: float = 0.0,
+    alpha_composite: float = 0.0,
 ) -> dict:
     """
     Compute the final ensemble meta-model score.
@@ -226,18 +228,19 @@ def compute_ensemble_score(
     weights = get_weights()
 
     # Component scores
-    sf_score  = float(np.clip(stockformer_score, -1.0, 1.0))
-    ofi_score = ofi_to_score(ofi_z, iceberg, stacked, trapped)
-    hmm_score = hmm_to_score(regime, regime_confidence, state_v3)
+    sf_score    = float(np.clip(stockformer_score, -1.0, 1.0))
+    ofi_score   = ofi_to_score(ofi_z, iceberg, stacked, trapped)
+    hmm_score   = hmm_to_score(regime, regime_confidence, state_v3)
+    alpha_score = float(np.clip(alpha_composite, -1.0, 1.0))
 
-    # Weighted ensemble
+    # Weighted ensemble (4 streams)
     raw_score = (
         weights["stockformer"] * sf_score +
         weights["ofi"]         * ofi_score +
-        weights["hmm"]         * hmm_score
+        weights["hmm"]         * hmm_score +
+        weights.get("alpha", 0.20) * alpha_score
     )
 
-    # No neutralization — it was compressing all scores toward 0, killing signal
     final_score = float(np.clip(raw_score, -1.0, 1.0))
 
     # Map to direction + confidence
@@ -258,6 +261,7 @@ def compute_ensemble_score(
         "stockformer_component": round(sf_score, 4),
         "ofi_component": round(ofi_score, 4),
         "hmm_component": round(hmm_score, 4),
+        "alpha_component": round(alpha_score, 4),
         "weights": weights,
         "spy_beta": round(spy_beta, 4),
         "neutralization_pct": NEUTRALIZATION_PCT,

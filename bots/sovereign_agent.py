@@ -531,6 +531,13 @@ def analyze(symbol: str, regime_state: str = "trend") -> dict:
         "bull_factors": bull,
         "bear_factors": bear,
         "regime": regime_state,
+        # Daily OHLCV for Alpha Factory (WorldQuant 101 formulaic alphas)
+        "daily_closes": df["close"].values.tolist(),
+        "daily_volumes": df["volume"].values.tolist(),
+        "daily_opens": df["open"].values.tolist() if "open" in df.columns else df["close"].values.tolist(),
+        "daily_highs": df["high"].values.tolist() if "high" in df.columns else df["close"].values.tolist(),
+        "daily_lows": df["low"].values.tolist() if "low" in df.columns else df["close"].values.tolist(),
+        "daily_vwaps": df["vwap"].values.tolist() if "vwap" in df.columns else df["close"].values.tolist(),
     }
 
     print(f"[SOVEREIGN] {symbol}: {direction.upper()} @ {confidence:.2%} | AFD={afd_mom:.5f} | ORB={orb['orb_direction']} | Kelly={kelly_fraction:.2%}")

@@ -27,8 +27,9 @@ try:
 except ImportError:
     HAS_ZMQ = False
 
-# IPC socket path (local Unix domain socket — zero network overhead)
-EVENT_SOCKET = "ipc:///tmp/tow_events.sock"
+# TCP socket (brokerless, zero-config, HFT-standard)
+# Runs on localhost only — no external exposure
+EVENT_SOCKET = "tcp://127.0.0.1:5555"
 
 # Event type constants
 EVT_TRAPPED_EXHAUSTION = "TRAPPED_EXHAUSTION"

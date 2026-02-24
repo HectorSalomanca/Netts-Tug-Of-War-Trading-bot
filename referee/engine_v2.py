@@ -46,7 +46,8 @@ from quant.correlation_guard import filter_by_correlation
 from quant.regime_hmm import get_latest_regime_full
 from quant.meta_model import compute_ensemble_score
 from quant.stockformer import predict as stockformer_predict, SEQ_LEN, N_FEATURES, retrain_stockformer
-from quant.feature_factory import build_features
+from quant.feature_factory import build_features, compute_cross_sectional_deviation, zero_sum_allocation
+from quant.alpha_factory import compute_watchlist_alphas, compute_alpha_composite, ALPHA_FUNCTIONS
 from referee.net_guard import is_online, with_retry
 from quant.labeler import run_nightly_labeling, compute_atr_barriers
 from referee.event_bus import (
@@ -947,14 +948,53 @@ def run_cycle():
     s_map = {r["symbol"]: r for r in sovereign_results}
     m_map = {r["symbol"]: r for r in madman_results}
 
+    # ── Alpha Factory (WorldQuant 101 formulaic alphas) ─────
+    alpha_composites = {}
+    try:
+        watchlist_bar_data = {}
+        for s_result in sovereign_results:
+            sym = s_result["symbol"]
+            rd = s_result.get("raw_data", {})
+            if "daily_closes" in rd and len(rd["daily_closes"]) >= 20:
+                watchlist_bar_data[sym] = {
+                    "close": np.array(rd["daily_closes"]),
+                    "volume": np.array(rd.get("daily_volumes", [1000]*len(rd["daily_closes"]))),
+                    "open": np.array(rd.get("daily_opens", rd["daily_closes"])),
+                    "high": np.array(rd.get("daily_highs", rd["daily_closes"])),
+                    "low": np.array(rd.get("daily_lows", rd["daily_closes"])),
+                    "vwap": np.array(rd.get("daily_vwaps", rd["daily_closes"])),
+                }
+        if len(watchlist_bar_data) >= 5:
+            ranked_alphas = compute_watchlist_alphas(watchlist_bar_data)
+            for sym, alphas in ranked_alphas.items():
+                alpha_composites[sym] = compute_alpha_composite(alphas)
+            n_active = sum(1 for v in alpha_composites.values() if abs(v) > 0.05)
+            if n_active > 0:
+                print(f"[ALPHA] Computed {len(ALPHA_FUNCTIONS)} alphas for {len(ranked_alphas)} symbols ({n_active} active)")
+    except Exception as e:
+        print(f"[ALPHA] Alpha factory error (non-fatal): {e}")
+
+    # ── Cross-Sectional Deviation (Optiver strategy) ───────
+    # Strip macro noise: only trade symbols with exceptional OFI vs peers
+    raw_ofi_map = {}
+    raw_sf_map = {}
+    for symbol in safe_symbols:
+        m_result = m_map.get(symbol)
+        raw_ofi_map[symbol] = m_result["raw_data"].get("ofi_z_score", 0.0) if m_result else 0.0
+        raw_sf_map[symbol] = sf_scores.get(symbol, 0.0)
+
+    ofi_dev = compute_cross_sectional_deviation(raw_ofi_map)
+    sf_dev = compute_cross_sectional_deviation(raw_sf_map)
+
     # ── P1: Compute ensemble scores BEFORE execution ─────────
     regime_data_full = get_latest_regime_full()
     state_v3 = regime_data_full.get("state_v3", "")
     ensemble_map = {}
     for symbol in safe_symbols:
-        sf = sf_scores.get(symbol, 0.0)
+        # Use cross-sectional deviation: only exceptional signals pass through
+        sf = sf_dev.get(symbol, sf_scores.get(symbol, 0.0))
         m_result = m_map.get(symbol)
-        ofi_z = m_result["raw_data"].get("ofi_z_score", 0.0) if m_result else 0.0
+        ofi_z = ofi_dev.get(symbol, 0.0)
         iceberg = m_result["raw_data"].get("iceberg_detected", False) if m_result else False
         stacked = m_result["raw_data"].get("stacked_imbalance", False) if m_result else False
         trapped = m_result["raw_data"].get("trapped_exhaustion", False) if m_result else False
@@ -963,10 +1003,19 @@ def run_cycle():
             stacked=stacked, trapped=trapped,
             regime=regime, regime_confidence=crisis_conf,
             state_v3=state_v3,
+            alpha_composite=alpha_composites.get(symbol, 0.0),
         )
         ensemble_map[symbol] = ens
         if ens["ensemble_direction"] != "neutral":
             print(f"[META] {symbol}: {ens['ensemble_direction'].upper()} score={ens['ensemble_score']:.3f} (SF={ens['stockformer_component']:.3f} OFI={ens['ofi_component']:.3f} HMM={ens['hmm_component']:.3f})")
+
+    # ── Zero-Sum Post-Processing (Optiver strategy) ─────────
+    # Force ensemble scores to sum to zero → beta-neutral micro-portfolio
+    raw_ens_scores = {sym: ens["ensemble_score"] for sym, ens in ensemble_map.items()}
+    zs_scores = zero_sum_allocation(raw_ens_scores)
+    for sym in ensemble_map:
+        ensemble_map[sym]["ensemble_score_raw"] = ensemble_map[sym]["ensemble_score"]
+        ensemble_map[sym]["ensemble_score"] = zs_scores.get(sym, ensemble_map[sym]["ensemble_score"])
 
     # ── Exit checks first ─────────────────────────────────────
     position_manager.run_exit_checks(s_map, m_map, regime=regime)

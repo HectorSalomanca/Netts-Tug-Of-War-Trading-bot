@@ -132,6 +132,81 @@ def compute_pure_alpha_momentum(
     return float(np.mean(residuals[-lookback:]))
 
 
+# ── Cross-Sectional Deviation (Optiver 1st Place Strategy) ───────────────────
+
+def compute_cross_sectional_deviation(symbol_values: dict) -> dict:
+    """
+    Optiver Kaggle winning technique: subtract the cross-sectional median
+    from each symbol's feature value. This strips macro-market noise.
+
+    If the whole market's OFI spikes, NVDA's OFI spike isn't special.
+    Only buy NVDA if its order flow is exceptionally aggressive vs peers.
+
+    Args:
+        symbol_values: {symbol: raw_value} for a single feature across all symbols
+    Returns:
+        {symbol: deviation_from_median}
+    """
+    if not symbol_values:
+        return {}
+    values = np.array(list(symbol_values.values()))
+    median_val = float(np.median(values))
+    return {sym: round(float(val - median_val), 6) for sym, val in symbol_values.items()}
+
+
+def compute_all_deviations(watchlist_features: dict) -> dict:
+    """
+    Compute cross-sectional deviations for all features across the watchlist.
+
+    Args:
+        watchlist_features: {symbol: {feature_name: value, ...}, ...}
+    Returns:
+        {symbol: {feature_name_dev: deviation, ...}, ...}
+    """
+    if not watchlist_features:
+        return {}
+
+    # Collect all feature names from first symbol
+    first_sym = next(iter(watchlist_features))
+    feature_names = list(watchlist_features[first_sym].keys())
+
+    # For each feature, compute cross-sectional deviation
+    deviations = {sym: {} for sym in watchlist_features}
+    for feat in feature_names:
+        raw_values = {}
+        for sym, feats in watchlist_features.items():
+            val = feats.get(feat, 0.0)
+            if val is not None and np.isfinite(val):
+                raw_values[sym] = val
+
+        if len(raw_values) >= 3:  # need at least 3 symbols for meaningful median
+            devs = compute_cross_sectional_deviation(raw_values)
+            for sym, dev in devs.items():
+                deviations[sym][f"{feat}_dev"] = dev
+
+    return deviations
+
+
+def zero_sum_allocation(scores: dict) -> dict:
+    """
+    Optiver zero-sum post-processing: adjust scores so they sum to zero.
+    This forces the portfolio to be beta-neutral within the micro-portfolio.
+
+    If the bot wants to buy 3 tech stocks, this dynamically sizes them
+    so you are actively hedging beta within the portfolio itself.
+
+    Args:
+        scores: {symbol: raw_score}
+    Returns:
+        {symbol: zero_sum_adjusted_score}
+    """
+    if not scores:
+        return {}
+    values = np.array(list(scores.values()))
+    mean_score = float(np.mean(values))
+    return {sym: round(float(val - mean_score), 6) for sym, val in scores.items()}
+
+
 # ── Combined Feature Vector ───────────────────────────────────────────────────
 
 def build_features(
