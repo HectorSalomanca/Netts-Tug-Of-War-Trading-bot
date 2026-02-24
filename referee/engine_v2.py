@@ -93,7 +93,8 @@ CRISIS_CONF_THRESHOLD = 0.90   # only hedge if HMM is ≥90% confident in Crisis
 # ── Position sizing ───────────────────────────────────────────────────────────
 BASE_RISK_PCT   = 0.03    # 3% equity per trade (floor) — 2% was too small
 MAX_RISK_PCT    = 0.06    # 6% equity hard cap
-MAX_OPEN_TRADES = 4
+MAX_OPEN_TRADES_LEGACY = 6    # fallback cap when quantum allocator is unavailable
+MAX_OPEN_TRADES_CEILING = 12  # absolute safety ceiling (allocator controls actual count via λw'Σw)
 
 # ── Execution thresholds ──────────────────────────────────────────────────────
 SOVEREIGN_MIN_CONF  = 0.60   # lowered: old 75% was unreachable with neutralization
@@ -1212,7 +1213,9 @@ def run_cycle():
 
     executed = skipped_crowded = skipped_no_signal = 0
     open_positions = get_open_position_count()
-    print(f"[REFEREE] Open positions: {open_positions}/{MAX_OPEN_TRADES}")
+    # Dynamic position limit: allocator controls count, ceiling is safety net
+    max_positions = MAX_OPEN_TRADES_CEILING
+    print(f"[REFEREE] Open positions: {open_positions}/{max_positions} (allocator-driven)")
 
     # Build list of currently held symbols + current weights for allocator
     try:
@@ -1364,8 +1367,10 @@ def run_cycle():
             log_skipped_signal(symbol, exec_side, "correlation_guard", ens.get("ensemble_score", 0), get_mid_price(symbol))
             skipped_crowded += 1
             continue
-        if open_positions >= MAX_OPEN_TRADES:
-            print(f"[REFEREE] {symbol}: max positions reached, skipping")
+        # Dynamic limit: if allocator is active, use ceiling; otherwise legacy cap
+        effective_max = max_positions if qa_allocation else MAX_OPEN_TRADES_LEGACY
+        if open_positions >= effective_max:
+            print(f"[REFEREE] {symbol}: max positions reached ({open_positions}/{effective_max}), skipping")
             ens = ensemble_map.get(symbol, {})
             log_skipped_signal(symbol, exec_side, "max_positions", ens.get("ensemble_score", 0), get_mid_price(symbol))
             skipped_crowded += 1
