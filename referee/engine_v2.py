@@ -98,6 +98,29 @@ SOVEREIGN_MIN_CONF  = 0.60   # lowered: old 75% was unreachable with neutralizat
 SOVEREIGN_SOLO_CONF = 0.70   # lowered: ensemble override provides real conviction
 LIMIT_SLIP_PCT      = 0.0015   # limit price = mid ± 0.15% (wider — 0.05% was getting 100% IOC cancels)
 
+# ── Maker/Taker Dynamic Routing ──────────────────────────────────────────────
+# Chop = be a Maker (post passive limit, capture spread + rebates)
+# Trend = be a Taker (cross spread, pay fee, guarantee fill)
+MAKER_REGIMES = {"chop"}                    # regimes where we post passive limits
+TAKER_REGIMES = {"trend", "trend_bull", "trend_bear", "crisis"}
+TAKER_AGGRESSION_CENTS = 0.02               # cross spread by 2 cents in taker mode
+MAKER_PATIENCE_SEC     = 30                 # wait N seconds for passive fill before cancel
+
+# ── LOB Queue Position Simulator (paper trade realism) ───────────────────────
+# In paper trading, only count a passive fill if the market traded THROUGH
+# our limit price. Touching is not filling — you're at the back of the queue.
+QUEUE_SIM_ENABLED      = True               # enable queue position penalty
+QUEUE_TRADE_THROUGH_BP = 1.0                # price must trade 1bp through limit to "fill"
+
+# ── Alpha Decay & Turnover Penalty ───────────────────────────────────────────
+# Don't flip positions unless the new signal's expected return exceeds
+# the current position's expected return PLUS 2x round-trip transaction costs.
+# Constraint: E[R_new] > E[R_current] + 2 * (fees + slippage)
+EST_FEE_BPS            = 1.0                # estimated exchange fee per side (bps)
+EST_SLIPPAGE_BPS       = 2.0                # estimated slippage per side (bps)
+TURNOVER_COST_BPS      = 2 * (EST_FEE_BPS + EST_SLIPPAGE_BPS)  # = 6 bps round-trip
+FLIP_HURDLE_MULTIPLIER = 2.0                # require 2x the cost to flip
+
 # ── Regime-adjusted stops ─────────────────────────────────────────────────────
 # Off-round numbers: trigger slightly before institutional round-number clusters
 # (e.g. 1.9% stop fires before the crowd's 2% stops get swept)
@@ -711,7 +734,110 @@ def _place_bracket_orders(symbol: str, side: str, filled_price: float, qty: int,
         print(f"[BRACKET] {asym}: bracket order error — {e}")
 
 
-# ── Execution ─────────────────────────────────────────────────────────────────
+# ── LOB Queue Position Simulator ─────────────────────────────────────────────
+
+def _simulate_queue_fill(symbol: str, side: str, limit_price: float, wait_sec: int = 5) -> bool:
+    """
+    Paper-trade realism: simulate LOB queue position.
+
+    In real markets, a passive limit order at $150.00 sits at the BACK of the
+    queue. The price must trade THROUGH $150.00 (i.e., to $149.99 for a buy)
+    for us to get filled. Paper APIs lie — they fill on touch.
+
+    This function checks if the market actually traded through our limit price
+    during the wait period. If not, the passive order is considered unfilled.
+    """
+    if not QUEUE_SIM_ENABLED:
+        return True  # disabled → assume fill (paper API behavior)
+
+    asym = _alpaca_sym(symbol)
+    try:
+        # Check the latest trade price after waiting
+        time.sleep(wait_sec)
+        req = StockLatestQuoteRequest(symbol_or_symbols=asym, feed=DataFeed.IEX)
+        quote = data_client.get_stock_latest_quote(req)
+        bid = float(quote[asym].bid_price or 0)
+        ask = float(quote[asym].ask_price or 0)
+        mid = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else limit_price
+
+        # For a BUY limit: market must trade BELOW our limit (sellers came to us)
+        # For a SELL limit: market must trade ABOVE our limit (buyers came to us)
+        threshold_bp = QUEUE_TRADE_THROUGH_BP / 10000.0
+        if side == "buy":
+            # Price must drop below our bid by threshold
+            filled = mid <= limit_price * (1 - threshold_bp)
+        else:
+            # Price must rise above our ask by threshold
+            filled = mid >= limit_price * (1 + threshold_bp)
+
+        if not filled:
+            print(f"[QUEUE_SIM] {asym}: passive {side.upper()} @ ${limit_price:.2f} NOT filled "
+                  f"(mid=${mid:.2f}, need {'<' if side == 'buy' else '>'}"
+                  f"${limit_price * (1 - threshold_bp if side == 'buy' else 1 + threshold_bp):.2f})")
+        return filled
+    except Exception:
+        return True  # on error, assume fill (don't block execution)
+
+
+# ── Alpha Decay & Turnover Filter ────────────────────────────────────────────
+
+def _passes_turnover_filter(
+    symbol: str,
+    new_side: str,
+    new_ensemble_score: float,
+    held_symbols: list,
+) -> bool:
+    """
+    Prevent position flips unless the expected return of the new signal
+    strictly exceeds the current position's expected return + 2x transaction costs.
+
+    Constraint: E[R_new] > E[R_current] + 2 × (Fees + Slippage)
+
+    This kills alpha decay from high turnover — the #1 killer of micro-funds.
+    With 19 WorldQuant alphas generating frequent signals, this gate ensures
+    we only flip when the edge is large enough to pay for the round trip.
+    """
+    asym = _alpaca_sym(symbol)
+
+    # Not a flip if we don't hold the symbol
+    if asym not in held_symbols and symbol not in held_symbols:
+        return True  # new entry, not a flip — always allowed
+
+    # Check if this is actually a flip (opposite side of current position)
+    try:
+        pos = trading_client.get_open_position(asym)
+        current_side = "buy" if float(pos.qty) > 0 else "sell"
+        if current_side == new_side:
+            return True  # same direction — adding to position, not flipping
+
+        # It's a flip. Calculate hurdle.
+        current_unrealized_pct = float(pos.unrealized_plpc or 0)  # current P&L %
+        # E[R_current] = current unrealized P&L (what we'd give up by closing)
+        e_current = current_unrealized_pct * 10000  # convert to bps
+
+        # E[R_new] = ensemble score mapped to expected bps
+        # Ensemble score of 0.3 ≈ 30bps expected return (rough calibration)
+        e_new = abs(new_ensemble_score) * 100  # score → bps
+
+        # Hurdle: E[R_new] > E[R_current] + 2 * (fees + slippage)
+        # The 2x covers BOTH the close of current AND the open of new
+        hurdle = e_current + FLIP_HURDLE_MULTIPLIER * TURNOVER_COST_BPS
+
+        if e_new <= hurdle:
+            print(f"[TURNOVER] {symbol}: FLIP BLOCKED — "
+                  f"E[R_new]={e_new:.1f}bps <= hurdle={hurdle:.1f}bps "
+                  f"(E[R_cur]={e_current:.1f}bps + {FLIP_HURDLE_MULTIPLIER:.0f}×{TURNOVER_COST_BPS:.0f}bps cost)")
+            return False
+
+        print(f"[TURNOVER] {symbol}: flip APPROVED — "
+              f"E[R_new]={e_new:.1f}bps > hurdle={hurdle:.1f}bps")
+        return True
+
+    except Exception:
+        return True  # can't fetch position → not a flip
+
+
+# ── Execution (Maker/Taker Dynamic Routing) ──────────────────────────────────
 
 def execute_trade(
     tug_result_id: Optional[str],
@@ -724,122 +850,184 @@ def execute_trade(
 ) -> Optional[dict]:
 
     qty, micro_price, bid, ask, bid_size, ask_size = compute_qty(symbol, kelly_fraction, equity, is_strong)
-    qty = max(int(qty), 1)  # CRITICAL: Limit IOC requires whole shares
+    qty = max(int(qty), 1)
     order_side = OrderSide.BUY if side == "buy" else OrderSide.SELL
 
-    # Sell guard: if selling, we must hold the position (paper can't naked short)
+    # Sell guard: if selling, we must hold the position
     if side == "sell":
         held = get_existing_position_qty(symbol)
         if held <= 0:
             print(f"[REFEREE] {symbol}: no position to sell, skipping")
             return None
-        qty = max(int(min(held, qty)), 1)  # can't sell more than we hold
-
-    # Stoikov Micro-Price execution: place limit at micro-price + small buffer
-    # (micro-price already accounts for bid/ask imbalance, so we need less slip)
-    MICRO_SLIP = 0.0008  # 0.08% — tighter than old 0.15% because micro-price is more accurate
-    if side == "buy":
-        limit_price = round(micro_price * (1 + MICRO_SLIP), 2)
-    else:
-        limit_price = round(micro_price * (1 - MICRO_SLIP), 2)
+        qty = max(int(min(held, qty)), 1)
 
     mid_price = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else micro_price
+    spread = ask - bid if (bid > 0 and ask > 0) else 0.01
     asym = _alpaca_sym(symbol)
+
+    # ── MAKER/TAKER ROUTING DECISION ─────────────────────────────────
+    # Chop regime: be a Maker — post passive limit at the bid/ask
+    #   → capture spread, earn exchange rebates, zero market impact
+    # Trend regime: be a Taker — cross the spread aggressively
+    #   → pay fee but guarantee fill before the train leaves
+    use_maker = regime in MAKER_REGIMES
+
+    if use_maker:
+        # MAKER MODE: post passive limit at the near side of the book
+        if side == "buy":
+            limit_price = round(bid, 2)           # sit on the bid
+        else:
+            limit_price = round(ask, 2)           # sit on the ask
+        order_detail = "maker_passive"
+        tif = TimeInForce.DAY                     # patient — let it work
+        print(f"[MAKER] {asym}: passive {side.upper()} @ ${limit_price:.2f} "
+              f"(spread=${spread:.2f}, regime={regime})")
+    else:
+        # TAKER MODE: aggressive marketable limit — cross the spread
+        if side == "buy":
+            # Stoikov micro-price + aggression buffer to guarantee fill
+            limit_price = round(micro_price + TAKER_AGGRESSION_CENTS, 2)
+        else:
+            limit_price = round(micro_price - TAKER_AGGRESSION_CENTS, 2)
+        order_detail = "taker_aggressive"
+        tif = TimeInForce.IOC                     # immediate — no patience
+        print(f"[TAKER] {asym}: aggressive {side.upper()} @ ${limit_price:.2f} "
+              f"(micro=${micro_price:.2f} +{TAKER_AGGRESSION_CENTS*100:.0f}¢, regime={regime})")
+
     shortfall_bps = round(abs(limit_price - mid_price) / mid_price * 10000, 2)
-    imbalance_str = f"bid_sz={int(bid_size)} ask_sz={int(ask_size)} micro=${micro_price:.2f}"
 
     try:
-        # Strategy: Try IOC first for best execution, fall back to DAY limit
+        # ── Submit the order ─────────────────────────────────────────
         order_req = LimitOrderRequest(
             symbol=asym, qty=qty, side=order_side,
-            time_in_force=TimeInForce.IOC, limit_price=limit_price,
+            time_in_force=tif, limit_price=limit_price,
         )
         order = trading_client.submit_order(order_req)
         alpaca_id = str(order.id)
-        print(f"[REFEREE] IOC submitted: {side.upper()} {int(qty)} {asym} @ ${limit_price} | shortfall={shortfall_bps}bps | ID={alpaca_id}")
+        print(f"[EXEC] {order_detail.upper()}: {side.upper()} {int(qty)} {asym} @ ${limit_price} "
+              f"| shortfall={shortfall_bps}bps | ID={alpaca_id}")
 
-        # Check if IOC filled
-        time.sleep(2)
-        order_status = trading_client.get_order_by_id(alpaca_id)
-        status_str = str(order_status.status).lower()
-        filled_qty = float(order_status.filled_qty or 0)
+        # ── Check fill status ────────────────────────────────────────
+        if use_maker:
+            # MAKER: wait patiently, then apply queue position simulator
+            queue_filled = _simulate_queue_fill(symbol, side, limit_price, wait_sec=MAKER_PATIENCE_SEC)
+            if not queue_filled:
+                # Queue sim says we wouldn't have filled in real life
+                # Cancel the order and log as queue-blocked
+                try:
+                    trading_client.cancel_order_by_id(alpaca_id)
+                except Exception:
+                    pass
+                print(f"[QUEUE_SIM] {asym}: cancelling passive order — queue penalty applied")
+                if USER_ID:
+                    supabase.table("trades").insert({
+                        "tug_result_id": tug_result_id, "symbol": symbol,
+                        "side": side, "qty": int(qty),
+                        "order_type": "limit", "order_type_detail": "maker_queue_blocked",
+                        "limit_price": limit_price, "alpaca_order_id": alpaca_id,
+                        "status": "queue_blocked", "implementation_shortfall_bps": 0,
+                        "user_id": USER_ID,
+                    }).execute()
+                return None
 
+            # Queue sim passed — check actual Alpaca fill status
+            order_status = trading_client.get_order_by_id(alpaca_id)
+            status_str = str(order_status.status).lower()
+            filled_qty = float(order_status.filled_qty or 0)
+        else:
+            # TAKER: IOC — check immediately after brief pause
+            time.sleep(2)
+            order_status = trading_client.get_order_by_id(alpaca_id)
+            status_str = str(order_status.status).lower()
+            filled_qty = float(order_status.filled_qty or 0)
+
+        # ── Process fill ─────────────────────────────────────────────
         if "filled" in status_str and filled_qty > 0:
             filled_price = float(order_status.filled_avg_price or limit_price)
             real_shortfall = round(abs(filled_price - mid_price) / mid_price * 10000, 2)
-            print(f"[FILL] {asym}: IOC FILLED {int(filled_qty)} @ ${filled_price:.2f} | shortfall={real_shortfall}bps")
+            mode_tag = "MAKER" if use_maker else "TAKER"
+            print(f"[FILL] {asym}: {mode_tag} FILLED {int(filled_qty)} @ ${filled_price:.2f} | shortfall={real_shortfall}bps")
             # TCA: measure market impact + schedule adverse selection tracking
             impact = measure_market_impact(symbol, side, micro_price, filled_price, int(filled_qty))
             print(f"[TCA] {asym}: impact={impact['signed_impact_bps']:+.1f}bps (micro=${micro_price:.2f} fill=${filled_price:.2f})")
             schedule_adverse_selection_check(symbol, side, filled_price, datetime.now(timezone.utc), alpaca_id)
-            # Place server-side bracket (stop-market + take-profit) — survives offline
             _place_bracket_orders(symbol, side, filled_price, int(filled_qty), regime)
             if USER_ID:
                 supabase.table("trades").insert({
                     "tug_result_id": tug_result_id, "symbol": symbol,
                     "side": side, "qty": int(filled_qty),
-                    "order_type": "limit", "order_type_detail": "limit_ioc",
+                    "order_type": "limit", "order_type_detail": order_detail,
                     "limit_price": filled_price, "alpaca_order_id": alpaca_id,
                     "status": "filled", "implementation_shortfall_bps": real_shortfall,
                     "user_id": USER_ID,
                 }).execute()
             return {"alpaca_order_id": alpaca_id, "qty": int(filled_qty), "side": side, "shortfall_bps": real_shortfall}
 
-        # IOC cancelled/expired → fall back to DAY limit with wider slip
-        print(f"[FILL] {asym}: IOC {status_str} — retrying as DAY limit")
-        day_slip = 0.0025  # 0.25% — wider to guarantee fill
-        if side == "buy":
-            day_limit = round(mid_price * (1 + day_slip), 2)
-        else:
-            day_limit = round(mid_price * (1 - day_slip), 2)
+        # ── Taker IOC missed → fall back to DAY limit with wider slip ─
+        if not use_maker:
+            print(f"[FILL] {asym}: IOC {status_str} — retrying as DAY limit")
+            day_slip = 0.0025  # 0.25% — wider to guarantee fill
+            if side == "buy":
+                day_limit = round(mid_price * (1 + day_slip), 2)
+            else:
+                day_limit = round(mid_price * (1 - day_slip), 2)
 
-        day_req = LimitOrderRequest(
-            symbol=asym, qty=qty, side=order_side,
-            time_in_force=TimeInForce.DAY, limit_price=day_limit,
-        )
-        day_order = trading_client.submit_order(day_req)
-        day_id = str(day_order.id)
-        day_shortfall = round(abs(day_limit - mid_price) / mid_price * 10000, 2)
-        print(f"[REFEREE] DAY fallback: {side.upper()} {int(qty)} {asym} @ ${day_limit} | shortfall={day_shortfall}bps | ID={day_id}")
+            day_req = LimitOrderRequest(
+                symbol=asym, qty=qty, side=order_side,
+                time_in_force=TimeInForce.DAY, limit_price=day_limit,
+            )
+            day_order = trading_client.submit_order(day_req)
+            day_id = str(day_order.id)
+            day_shortfall = round(abs(day_limit - mid_price) / mid_price * 10000, 2)
+            print(f"[EXEC] DAY fallback: {side.upper()} {int(qty)} {asym} @ ${day_limit} | shortfall={day_shortfall}bps")
 
-        # Check if DAY order filled immediately (extended hours often fills fast)
-        time.sleep(3)
-        day_status = trading_client.get_order_by_id(day_id)
-        day_status_str = str(day_status.status).lower()
-        day_filled_qty = float(day_status.filled_qty or 0)
-        day_filled_price = float(day_status.filled_avg_price or day_limit)
+            time.sleep(3)
+            day_status = trading_client.get_order_by_id(day_id)
+            day_status_str = str(day_status.status).lower()
+            day_filled_qty = float(day_status.filled_qty or 0)
+            day_filled_price = float(day_status.filled_avg_price or day_limit)
 
-        if "filled" in day_status_str and day_filled_qty > 0:
-            real_shortfall = round(abs(day_filled_price - mid_price) / mid_price * 10000, 2)
-            print(f"[FILL] {asym}: DAY FILLED {int(day_filled_qty)} @ ${day_filled_price:.2f}")
-            # TCA: measure market impact + schedule adverse selection tracking
-            impact = measure_market_impact(symbol, side, micro_price, day_filled_price, int(day_filled_qty))
-            print(f"[TCA] {asym}: impact={impact['signed_impact_bps']:+.1f}bps")
-            schedule_adverse_selection_check(symbol, side, day_filled_price, datetime.now(timezone.utc), day_id)
-            # Place bracket immediately on confirmed fill
-            _place_bracket_orders(symbol, side, day_filled_price, int(day_filled_qty), regime)
+            if "filled" in day_status_str and day_filled_qty > 0:
+                real_shortfall = round(abs(day_filled_price - mid_price) / mid_price * 10000, 2)
+                print(f"[FILL] {asym}: DAY FILLED {int(day_filled_qty)} @ ${day_filled_price:.2f}")
+                impact = measure_market_impact(symbol, side, micro_price, day_filled_price, int(day_filled_qty))
+                print(f"[TCA] {asym}: impact={impact['signed_impact_bps']:+.1f}bps")
+                schedule_adverse_selection_check(symbol, side, day_filled_price, datetime.now(timezone.utc), day_id)
+                _place_bracket_orders(symbol, side, day_filled_price, int(day_filled_qty), regime)
+                if USER_ID:
+                    supabase.table("trades").insert({
+                        "tug_result_id": tug_result_id, "symbol": symbol,
+                        "side": side, "qty": int(day_filled_qty),
+                        "order_type": "limit", "order_type_detail": "taker_day_fallback",
+                        "limit_price": day_filled_price, "alpaca_order_id": day_id,
+                        "status": "filled", "implementation_shortfall_bps": real_shortfall,
+                        "user_id": USER_ID,
+                    }).execute()
+                return {"alpaca_order_id": day_id, "qty": int(day_filled_qty), "side": side, "shortfall_bps": real_shortfall}
+
+            # Still pending
             if USER_ID:
                 supabase.table("trades").insert({
                     "tug_result_id": tug_result_id, "symbol": symbol,
-                    "side": side, "qty": int(day_filled_qty),
-                    "order_type": "limit", "order_type_detail": "limit_day_fallback",
-                    "limit_price": day_filled_price, "alpaca_order_id": day_id,
-                    "status": "filled", "implementation_shortfall_bps": real_shortfall,
+                    "side": side, "qty": int(qty),
+                    "order_type": "limit", "order_type_detail": "taker_day_fallback",
+                    "limit_price": day_limit, "alpaca_order_id": day_id,
+                    "status": "pending", "implementation_shortfall_bps": day_shortfall,
                     "user_id": USER_ID,
                 }).execute()
-            return {"alpaca_order_id": day_id, "qty": int(day_filled_qty), "side": side, "shortfall_bps": real_shortfall}
+            return {"alpaca_order_id": day_id, "qty": int(qty), "side": side, "shortfall_bps": day_shortfall}
 
-        # Still pending — log as pending, reconciliation will update + bracket on next cycle
+        # Maker order still pending after queue sim passed
         if USER_ID:
             supabase.table("trades").insert({
                 "tug_result_id": tug_result_id, "symbol": symbol,
                 "side": side, "qty": int(qty),
-                "order_type": "limit", "order_type_detail": "limit_day_fallback",
-                "limit_price": day_limit, "alpaca_order_id": day_id,
-                "status": "pending", "implementation_shortfall_bps": day_shortfall,
+                "order_type": "limit", "order_type_detail": "maker_pending",
+                "limit_price": limit_price, "alpaca_order_id": alpaca_id,
+                "status": "pending", "implementation_shortfall_bps": shortfall_bps,
                 "user_id": USER_ID,
             }).execute()
-        return {"alpaca_order_id": day_id, "qty": int(qty), "side": side, "shortfall_bps": day_shortfall}
+        return {"alpaca_order_id": alpaca_id, "qty": int(qty), "side": side, "shortfall_bps": shortfall_bps}
 
     except Exception as e:
         print(f"[REFEREE] Order error for {symbol}: {e}")
@@ -847,7 +1035,7 @@ def execute_trade(
             supabase.table("trades").insert({
                 "tug_result_id": tug_result_id, "symbol": symbol,
                 "side": side, "qty": int(qty),
-                "order_type": "limit", "order_type_detail": "limit_ioc",
+                "order_type": "limit", "order_type_detail": order_detail,
                 "limit_price": limit_price, "status": "rejected",
                 "user_id": USER_ID,
             }).execute()
@@ -1122,6 +1310,14 @@ def run_cycle():
             ens = ensemble_map.get(symbol, {})
             log_skipped_signal(symbol, exec_side, "max_positions", ens.get("ensemble_score", 0), get_mid_price(symbol))
             skipped_crowded += 1
+            continue
+
+        # Alpha Decay & Turnover Penalty: block flips that don't clear the hurdle
+        ens = ensemble_map.get(symbol, {})
+        ens_score_for_flip = ens.get("ensemble_score", 0.0)
+        if not _passes_turnover_filter(symbol, exec_side, ens_score_for_flip, held_symbols):
+            log_skipped_signal(symbol, exec_side, "turnover_filter", ens_score_for_flip, get_mid_price(symbol))
+            skipped_no_signal += 1
             continue
 
         kelly_fraction = s_result["raw_data"].get("kelly_fraction", 0.02)
