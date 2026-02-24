@@ -168,12 +168,11 @@ def compute_gex_proxy() -> float:
 
 def build_feature_matrix(df: pd.DataFrame) -> np.ndarray:
     """
-    Five features per day (V4):
+    Four features per day (V3 — GEX applied post-hoc, not in HMM training):
       - Realized volatility (20-day rolling std of returns, annualized)
       - 5-day momentum (return over last 5 days)
       - Volatility ratio (VIX proxy): 5-day vol / 20-day vol
       - Momentum acceleration: 5-day mom minus 20-day mom
-      - GEX proxy: appended to last row only (real-time options signal)
     """
     closes = df["close"].values
     returns = np.diff(closes) / closes[:-1]
@@ -193,13 +192,8 @@ def build_feature_matrix(df: pd.DataFrame) -> np.ndarray:
         vix_proxy = vol_5 / vol_20 if vol_20 > 0 else 1.0
         # Momentum acceleration
         mom_accel = mom_5 - mom_20
-        # GEX: 0 for historical rows (we only have real-time GEX)
-        features.append([vol_20, mom_5, vix_proxy, mom_accel, 0.0])
 
-    # Inject live GEX into the last row
-    if features:
-        gex = compute_gex_proxy()
-        features[-1][4] = gex
+        features.append([vol_20, mom_5, vix_proxy, mom_accel])
 
     return np.array(features)
 
@@ -310,10 +304,33 @@ def infer_current_regime() -> dict:
         current_state = "trend_bear"
         print(f"[HMM] Crisis downgraded to trend_bear (vol={current_vol:.3f} < {CRISIS_VOL_FLOOR})")
 
+    # ── GEX Post-Hoc Regime Adjustment ────────────────────────────────────────
+    # GEX is a real-time options signal that can't be used in HMM training
+    # (no historical GEX data). Instead, use it to modulate the HMM output:
+    #   - Strongly positive GEX (>0.3) + chop/trend_bull → reinforce chop (mean-reverting)
+    #   - Strongly negative GEX (<-0.3) + trend_bear → escalate to crisis
+    #   - Negative GEX + chop → downgrade to trend_bear (vol about to expand)
+    gex = compute_gex_proxy()
+    gex_adjusted = False
+    if abs(gex) > 0.3:
+        if gex < -0.3 and current_state == "chop":
+            current_state = "trend_bear"
+            gex_adjusted = True
+            print(f"[HMM] GEX override: chop → trend_bear (GEX={gex:+.3f}, dealers short gamma)")
+        elif gex < -0.3 and current_state == "trend_bear" and current_vol > 0.25:
+            current_state = "crisis"
+            gex_adjusted = True
+            print(f"[HMM] GEX override: trend_bear → crisis (GEX={gex:+.3f}, vol={current_vol:.3f})")
+        elif gex > 0.3 and current_state in ("trend_bull", "trend_bear"):
+            current_state = "chop"
+            gex_adjusted = True
+            print(f"[HMM] GEX override: {current_state} → chop (GEX={gex:+.3f}, dealers long gamma)")
+
     # Map V3 state to V2 for backward compat with engine
     v2_state = STATE_TO_V2.get(current_state, "trend")
 
-    print(f"[HMM] Regime: {current_state.upper()} (v2={v2_state}) (conf={confidence:.2%}, vol={current_vol:.3f}, mom={current_mom:.4f}, vix_proxy={current_vix:.2f})")
+    gex_tag = f", GEX={gex:+.3f}{'*' if gex_adjusted else ''}" if abs(gex) > 0.01 else ""
+    print(f"[HMM] Regime: {current_state.upper()} (v2={v2_state}) (conf={confidence:.2%}, vol={current_vol:.3f}, mom={current_mom:.4f}, vix_proxy={current_vix:.2f}{gex_tag})")
 
     return {
         "state": v2_state,
@@ -323,6 +340,8 @@ def infer_current_regime() -> dict:
         "spy_momentum": round(current_mom, 6),
         "vix_proxy": round(current_vix, 4),
         "momentum_accel": round(current_accel, 6),
+        "gex": round(gex, 4),
+        "gex_adjusted": gex_adjusted,
     }
 
 

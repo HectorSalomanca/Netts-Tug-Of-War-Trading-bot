@@ -49,6 +49,14 @@ from quant.stockformer import predict as stockformer_predict, SEQ_LEN, N_FEATURE
 from quant.feature_factory import build_features
 from referee.net_guard import is_online, with_retry
 from quant.labeler import run_nightly_labeling, compute_atr_barriers
+from referee.event_bus import (
+    get_subscriber, EVT_TRAPPED_EXHAUSTION, EVT_ICEBERG_DETECTED,
+    EVT_STACKED_IMBALANCE, EVT_OFI_EXTREME, EVT_SPREAD_BLOW,
+)
+from quant.tca import (
+    measure_market_impact, schedule_adverse_selection_check,
+    log_skipped_signal, measure_opportunity_cost,
+)
 
 load_dotenv()
 
@@ -759,6 +767,10 @@ def execute_trade(
             filled_price = float(order_status.filled_avg_price or limit_price)
             real_shortfall = round(abs(filled_price - mid_price) / mid_price * 10000, 2)
             print(f"[FILL] {asym}: IOC FILLED {int(filled_qty)} @ ${filled_price:.2f} | shortfall={real_shortfall}bps")
+            # TCA: measure market impact + schedule adverse selection tracking
+            impact = measure_market_impact(symbol, side, micro_price, filled_price, int(filled_qty))
+            print(f"[TCA] {asym}: impact={impact['signed_impact_bps']:+.1f}bps (micro=${micro_price:.2f} fill=${filled_price:.2f})")
+            schedule_adverse_selection_check(symbol, side, filled_price, datetime.now(timezone.utc), alpaca_id)
             # Place server-side bracket (stop-market + take-profit) — survives offline
             _place_bracket_orders(symbol, side, filled_price, int(filled_qty), regime)
             if USER_ID:
@@ -799,6 +811,10 @@ def execute_trade(
         if "filled" in day_status_str and day_filled_qty > 0:
             real_shortfall = round(abs(day_filled_price - mid_price) / mid_price * 10000, 2)
             print(f"[FILL] {asym}: DAY FILLED {int(day_filled_qty)} @ ${day_filled_price:.2f}")
+            # TCA: measure market impact + schedule adverse selection tracking
+            impact = measure_market_impact(symbol, side, micro_price, day_filled_price, int(day_filled_qty))
+            print(f"[TCA] {asym}: impact={impact['signed_impact_bps']:+.1f}bps")
+            schedule_adverse_selection_check(symbol, side, day_filled_price, datetime.now(timezone.utc), day_id)
             # Place bracket immediately on confirmed fill
             _place_bracket_orders(symbol, side, day_filled_price, int(day_filled_qty), regime)
             if USER_ID:
@@ -1048,10 +1064,14 @@ def run_cycle():
     for symbol, verdict, s_result, is_strong, exec_side in execute_candidates:
         if symbol not in approved_syms:
             print(f"[REFEREE] {symbol}: blocked by correlation guard")
+            ens = ensemble_map.get(symbol, {})
+            log_skipped_signal(symbol, exec_side, "correlation_guard", ens.get("ensemble_score", 0), get_mid_price(symbol))
             skipped_crowded += 1
             continue
         if open_positions >= MAX_OPEN_TRADES:
             print(f"[REFEREE] {symbol}: max positions reached, skipping")
+            ens = ensemble_map.get(symbol, {})
+            log_skipped_signal(symbol, exec_side, "max_positions", ens.get("ensemble_score", 0), get_mid_price(symbol))
             skipped_crowded += 1
             continue
 
@@ -1102,6 +1122,11 @@ def _run_labeler_background():
         print("[REFEREE] Ridge weights invalidated — will re-fit on next cycle")
     except Exception as e:
         print(f"[REFEREE] Labeler error: {e}")
+    # TCA: measure opportunity cost of skipped signals
+    try:
+        measure_opportunity_cost()
+    except Exception as e:
+        print(f"[REFEREE] TCA opportunity cost error: {e}")
 
 
 def _run_stockformer_retrain():
@@ -1122,9 +1147,93 @@ def run_once():
     run_cycle()
 
 
+# ── Event-Driven Architecture ─────────────────────────────────────────────────
+
+_event_sub = None
+_event_log = []  # recent events for TCA/audit trail
+
+def _init_event_subscriber():
+    """Initialize ZeroMQ subscriber for real-time microstructure events."""
+    global _event_sub
+    try:
+        _event_sub = get_subscriber()  # subscribe to all event types
+        # Register handlers for high-priority events
+        _event_sub.register_handler(EVT_TRAPPED_EXHAUSTION, _handle_trapped_exhaustion)
+        _event_sub.register_handler(EVT_SPREAD_BLOW, _handle_spread_blow)
+        _event_sub.register_handler(EVT_OFI_EXTREME, _handle_ofi_extreme)
+        print("[EDA] Event subscriber initialized — listening for real-time microstructure events")
+    except Exception as e:
+        print(f"[EDA] Subscriber init failed (non-fatal, polling still works): {e}")
+
+
+def _handle_trapped_exhaustion(evt: dict):
+    """
+    TRAPPED_EXHAUSTION: retail trapped at breakout peak, OFI flipped.
+    If we hold this symbol long, this is an early exit signal.
+    If we don't hold it, this is a potential short/fade opportunity.
+    """
+    symbol = evt.get("symbol", "")
+    ofi_z = evt.get("ofi_z", 0)
+    print(f"[EDA] ⚡ TRAPPED_EXHAUSTION on {symbol} (OFI Z={ofi_z:.2f}) — checking position")
+    _event_log.append(evt)
+
+    # Check if we hold this symbol — if so, tighten stop immediately
+    try:
+        held_qty = get_existing_position_qty(symbol)
+        if held_qty > 0:
+            print(f"[EDA] {symbol}: LONG position detected — trapped exhaustion is bearish, closing")
+            from referee.position_manager import close_position
+            close_position(symbol, f"EDA_TRAPPED_EXHAUSTION (OFI Z={ofi_z:.2f})")
+    except Exception as e:
+        print(f"[EDA] Trapped handler error: {e}")
+
+
+def _handle_spread_blow(evt: dict):
+    """
+    SPREAD_BLOW: liquidity withdrawal — market makers pulling quotes.
+    Cancel any pending orders for this symbol to avoid adverse fills.
+    """
+    symbol = evt.get("symbol", "")
+    ratio = evt.get("spread_ratio", 0)
+    print(f"[EDA] ⚠ SPREAD_BLOW on {symbol} (spread {ratio:.1f}x normal) — cancelling pending orders")
+    _event_log.append(evt)
+
+    try:
+        asym = _alpaca_sym(symbol)
+        orders = trading_client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[asym]))
+        for o in orders:
+            if str(o.status).lower() in ("new", "accepted", "pending_new"):
+                trading_client.cancel_order_by_id(o.id)
+                print(f"[EDA] Cancelled pending order {o.id} for {asym} (spread blow)")
+    except Exception as e:
+        print(f"[EDA] Spread blow handler error: {e}")
+
+
+def _handle_ofi_extreme(evt: dict):
+    """OFI_EXTREME: log for TCA analysis. No immediate action — ensemble handles this."""
+    _event_log.append(evt)
+    symbol = evt.get("symbol", "")
+    direction = evt.get("direction", "")
+    ofi_z = evt.get("ofi_z", 0)
+    print(f"[EDA] 📊 OFI_EXTREME on {symbol}: {direction.upper()} (Z={ofi_z:.2f})")
+
+
+def _process_realtime_events():
+    """Poll ZMQ for events between scheduled cycles. Called every 30s in the main loop."""
+    if not _event_sub:
+        return []
+    events = _event_sub.poll(max_events=100)
+    if events:
+        print(f"[EDA] Processed {len(events)} real-time event(s)")
+    return events
+
+
 def run_scheduled(interval_minutes: int = 15):
     print(f"[REFEREE V2] Starting — cycles every {interval_minutes} min | Regime HMM every 60 min | Scout every 30 min")
     print(f"[REFEREE V2] Watchlist: {WATCHLIST}")
+
+    # Initialize Event-Driven Architecture subscriber
+    _init_event_subscriber()
 
     # Initial HMM fit before first cycle
     _run_hmm_background()
@@ -1138,6 +1247,8 @@ def run_scheduled(interval_minutes: int = 15):
     run_cycle()
     while True:
         schedule.run_pending()
+        # EDA: process real-time events between polling cycles (~30s latency)
+        _process_realtime_events()
         time.sleep(30)
 
 

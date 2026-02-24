@@ -26,6 +26,19 @@ try:
 except ImportError:
     HAS_ARROW = False
 
+# Event-Driven Architecture: ZeroMQ publisher for real-time event broadcast
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    from referee.event_bus import (
+        get_publisher, EVT_TRAPPED_EXHAUSTION, EVT_ICEBERG_DETECTED,
+        EVT_STACKED_IMBALANCE, EVT_OFI_EXTREME, EVT_SPREAD_BLOW,
+    )
+    _event_pub = None  # lazy init after asyncio starts
+except ImportError:
+    _event_pub = None
+    EVT_TRAPPED_EXHAUSTION = EVT_ICEBERG_DETECTED = EVT_STACKED_IMBALANCE = None
+    EVT_OFI_EXTREME = EVT_SPREAD_BLOW = None
+
 load_dotenv()
 
 ALPACA_API_KEY    = os.getenv("ALPACA_API_KEY")
@@ -36,7 +49,15 @@ USER_ID           = os.getenv("USER_ID")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
-WATCHLIST = ["NVDA", "CRWD", "LLY", "TSMC", "JPM", "NEE", "CAT", "SONY", "PLTR", "MSTR"]
+WATCHLIST = [
+    "NVDA", "CRWD", "LLY", "TSM", "JPM", "NEE", "CAT", "SONY", "PLTR", "MSTR",
+    "MSFT", "AMZN", "META", "GLD", "XLE", "UBER", "AMD", "COIN", "MRNA", "IWM",
+]
+
+# Extreme OFI threshold for event broadcast
+OFI_EXTREME_Z = 2.5
+# Spread blow threshold (3x average = liquidity withdrawal)
+SPREAD_BLOW_MULT = 3.0
 
 OFI_WINDOW = 60
 ICEBERG_OFI_THRESHOLD = -1.5
@@ -269,6 +290,30 @@ async def flush_to_supabase():
                 print(f"[TAPE] {symbol}: OFI Z={ofi_z:.2f} | spread={avg_spread:.4%} | {flag_str}")
             else:
                 print(f"[TAPE] {symbol}: OFI Z={ofi_z:.2f} | spread={avg_spread:.4%}")
+
+            # ── EDA: Broadcast events via ZeroMQ ──────────────────
+            global _event_pub
+            if _event_pub is None:
+                try:
+                    _event_pub = get_publisher()
+                except Exception:
+                    _event_pub = None
+
+            if _event_pub:
+                evt_data = {"ofi_z": ofi_z, "mid_price": q["mid_price"], "spread_pct": avg_spread}
+                if trapped and EVT_TRAPPED_EXHAUSTION:
+                    _event_pub.publish(EVT_TRAPPED_EXHAUSTION, symbol, evt_data)
+                    print(f"[EVENT] >> {symbol}: TRAPPED_EXHAUSTION broadcast")
+                if iceberg and EVT_ICEBERG_DETECTED:
+                    _event_pub.publish(EVT_ICEBERG_DETECTED, symbol, evt_data)
+                if stacked and EVT_STACKED_IMBALANCE:
+                    _event_pub.publish(EVT_STACKED_IMBALANCE, symbol, evt_data)
+                if abs(ofi_z) > OFI_EXTREME_Z and EVT_OFI_EXTREME:
+                    _event_pub.publish(EVT_OFI_EXTREME, symbol, {**evt_data, "direction": "buy" if ofi_z > 0 else "sell"})
+                if avg_spread > 0 and len(spreads) > 10:
+                    baseline_spread = float(np.mean(list(spreads)[:max(len(spreads)-5, 1)]))
+                    if baseline_spread > 0 and avg_spread > baseline_spread * SPREAD_BLOW_MULT and EVT_SPREAD_BLOW:
+                        _event_pub.publish(EVT_SPREAD_BLOW, symbol, {**evt_data, "spread_ratio": avg_spread / baseline_spread})
 
         if records:
             try:
