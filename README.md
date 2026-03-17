@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/tug-of-war-banner.png" width="900" alt="NETTS Tug-Of-War Trading Bot banner"/>
+  <img src="docs/tug-of-war-banner.png" width="900" alt="NETTS Tug-Of-War Trading Bot banner"/>
 </p>
 
 # Tug-Of-War Sovereign Quant Trading System
