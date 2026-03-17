@@ -387,7 +387,7 @@ def get_latest_regime_full() -> dict:
                 datetime.now(timezone.utc) -
                 datetime.fromisoformat(row["created_at"].replace("Z", "+00:00"))
             ).total_seconds()
-            if age_seconds < 1800:
+            if age_seconds < 10800:
                 state = row["state"]
                 vol = row.get("spy_volatility", 0.0)
                 mom = row.get("spy_momentum", 0.0)

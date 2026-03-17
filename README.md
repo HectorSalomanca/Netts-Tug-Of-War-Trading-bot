@@ -50,7 +50,7 @@
                         │  Maker/Taker Router ── passive in Chop, aggressive in   │
                         │                        Trend (micro-price + 2¢)         │
                         │  LOB Queue Simulator ── paper-trade realism penalty     │
-                        │  ATR Brackets ──── dynamic stop/take on every fill      │
+                        │  ATR Protection ─── dynamic server-side stop on fills   │
                         │  TCA Logger ──── market impact + adverse selection      │
                         └──────────────────────┬──────────────────────────────────┘
                                                │
@@ -326,10 +326,9 @@ Every fill is measured:
 
 ### ATR-Based Dynamic Brackets
 
-Every fill gets server-side stop-loss and take-profit orders that survive laptop sleep:
+Every fill gets server-side stop protection that survives laptop sleep. The live engine currently places a single GTC stop-limit protection order per filled position to avoid over-reserving shares with multiple simple exit orders.
 
 ```
-Take Profit = 1.5 × ATR(20)    (2:1 reward/risk ratio)
 Stop Loss   = 0.75 × ATR(20)
 ```
 
@@ -373,11 +372,10 @@ Stop Loss   = 0.75 × ATR(20)
 
 | Control | Rule |
 |---|---|
-| Max open positions | 4 at any time |
+| Max open positions | Legacy fallback cap 6, hard ceiling 12, allocator decides actual occupancy |
 | Base risk per trade | 3% of equity (floor) |
 | Max risk per trade | 6% of equity (quantum allocator ceiling) |
 | Stop loss | ATR-based dynamic (0.75× ATR) |
-| Take profit | ATR-based dynamic (1.5× ATR) |
 | Earnings filter | Skip any symbol with earnings within 48 hours |
 | Correlation guard | Max 2 positions from same sector group |
 | Turnover filter | 12bps hurdle to flip positions |
@@ -386,7 +384,7 @@ Stop Loss   = 0.75 × ATR(20)
 | Crisis hedge | SQQQ (3× inverse QQQ) + weakest-symbol short |
 | EOD close | All positions closed by 3:45 PM ET |
 | High-noise window | No new entries 9:30-10:00 and 15:45-16:00 ET |
-| Offline resilience | Server-side brackets survive laptop sleep; cached regime for offline cycles |
+| Offline resilience | Server-side stop protection survives laptop sleep; cached regime for offline cycles |
 
 ---
 
@@ -466,7 +464,8 @@ pip3 install -r requirements.txt
 
 ```bash
 cp .env.example .env
-# Fill in your keys
+# Fill in your keys once, then migrate them into macOS Keychain
+python3 referee/secret_vault.py --store
 ```
 
 ```env
@@ -478,6 +477,8 @@ SUPABASE_ANON_KEY=your_anon_key
 SUPABASE_SERVICE_KEY=your_service_key
 USER_ID=your-supabase-user-uuid
 ```
+
+Runtime lookup is **Keychain-first** via `referee/secret_vault.py`, with environment variables only as a fallback/bootstrap path. After verifying Keychain access, delete the real `.env` file and keep only `.env.example` in git.
 
 Get Alpaca keys at [alpaca.markets](https://alpaca.markets/) (free paper trading).
 Get Supabase keys at [supabase.com](https://supabase.com/) (free tier).
@@ -523,6 +524,7 @@ npm run dev
 ### 6. 24/7 macOS Background Service
 
 ```bash
+# Edit the plist paths first — the repo versions contain local absolute paths
 cp com.tugofwar.trader.plist ~/Library/LaunchAgents/
 cp com.tugofwar.tape.plist ~/Library/LaunchAgents/
 launchctl load ~/Library/LaunchAgents/com.tugofwar.trader.plist
@@ -549,7 +551,7 @@ tail -f logs/tape.log
 | Paper realism | Instant fills | LOB queue position simulator — price must trade through limit |
 | Turnover control | None | 12bps hurdle to flip (E[R_new] > E[R_current] + 2×costs) |
 | Dark pools | Invisible | FINRA short volume + DIX aggregate tracking |
-| Risk management | Stop loss only | ATR brackets + 7 exit rules + crisis hedge + correlation guard |
+| Risk management | Stop loss only | ATR stop protection + exit checks + crisis hedge + correlation guard |
 | Microstructure | None | Real-time OFI + iceberg + trapped exhaustion + spread blow |
 | Cost analysis | None | Full TCA: market impact, adverse selection, opportunity cost |
 | Secrets | `.env` file | macOS Keychain encryption |

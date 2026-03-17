@@ -13,6 +13,7 @@ Upgrades over V2:
 import os
 import sys
 import asyncio
+import contextlib
 import numpy as np
 from collections import defaultdict, deque
 from datetime import datetime, timezone
@@ -360,14 +361,29 @@ def get_latest_ofi(symbol: str) -> dict:
 
 async def run_tape():
     print(f"[TAPE] Starting OFI stream for {len(WATCHLIST)} symbols...")
-    stream = StockDataStream(ALPACA_API_KEY, ALPACA_SECRET_KEY)
-
-    for symbol in WATCHLIST:
-        stream.subscribe_quotes(quote_handler, symbol)
-
     flush_task = asyncio.create_task(flush_to_supabase())
-    await stream._run_forever()
-    flush_task.cancel()
+    retry_delay = 5
+    try:
+        while True:
+            stream = StockDataStream(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+            try:
+                for symbol in WATCHLIST:
+                    stream.subscribe_quotes(quote_handler, symbol)
+                await stream._run_forever()
+                retry_delay = 5
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"[TAPE] data websocket error, restarting connection: {e}")
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 60)
+            finally:
+                with contextlib.suppress(Exception):
+                    await stream.stop_ws()
+    finally:
+        flush_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await flush_task
 
 
 if __name__ == "__main__":

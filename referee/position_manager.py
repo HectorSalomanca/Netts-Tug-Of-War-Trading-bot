@@ -13,6 +13,7 @@ This is what separates a real quant bot from a signal generator.
 
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from typing import Optional
 from collections import defaultdict
@@ -20,8 +21,8 @@ from collections import defaultdict
 import pytz
 from referee.secret_vault import get_secret
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, ClosePositionRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.requests import ClosePositionRequest, GetOrdersRequest
+from alpaca.trading.enums import QueryOrderStatus
 from supabase import create_client, Client
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -73,27 +74,208 @@ def is_near_close() -> bool:
     return close_time <= now_et <= market_close
 
 
+def _normalize_order_status(status) -> str:
+    s = str(status).lower()
+    if "partial" in s:
+        return "partial"
+    if "fill" in s:
+        return "filled"
+    if "reject" in s:
+        return "rejected"
+    if "expire" in s:
+        return "expired"
+    if "cancel" in s:
+        return "cancelled"
+    if "accept" in s or "new" in s or "pending" in s:
+        return "pending"
+    return s
+
+
+def _cancel_open_orders(symbol: str) -> int:
+    cancelled = 0
+    try:
+        orders = trading_client.get_orders(
+            filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
+        )
+        for order in orders:
+            trading_client.cancel_order_by_id(order.id)
+            cancelled += 1
+    except Exception as e:
+        print(f"[POS_MGR] Open-order cancel error for {symbol}: {e}")
+    return cancelled
+
+
+def _wait_for_order_release(symbol: str, wait_seconds: int = 6) -> bool:
+    deadline = time.time() + wait_seconds
+    while time.time() < deadline:
+        try:
+            orders = trading_client.get_orders(
+                filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
+            )
+            if not orders:
+                return True
+        except Exception:
+            pass
+        time.sleep(1)
+    return False
+
+
+def _wait_for_order_fill(order_id: Optional[str], wait_seconds: int = 8) -> dict:
+    if not order_id:
+        return {"status": "pending", "filled_qty": 0.0, "fill_price": None}
+    deadline = time.time() + wait_seconds
+    last_status = "pending"
+    while time.time() < deadline:
+        try:
+            order = trading_client.get_order_by_id(order_id)
+            status = _normalize_order_status(order.status)
+            last_status = status
+            filled_qty = float(order.filled_qty or 0)
+            fill_price = float(order.filled_avg_price or 0) or None
+            if status in ("filled", "cancelled", "expired", "rejected") or filled_qty > 0:
+                return {
+                    "status": status,
+                    "filled_qty": filled_qty,
+                    "fill_price": fill_price,
+                }
+        except Exception:
+            pass
+        time.sleep(1)
+    return {"status": last_status, "filled_qty": 0.0, "fill_price": None}
+
+
 def close_position(symbol: str, reason: str, qty: Optional[float] = None):
+    try:
+        position = trading_client.get_open_position(symbol)
+    except Exception as e:
+        print(f"[POS_MGR] {symbol}: no open position to close ({e})")
+        return None
+
+    signed_qty = float(position.qty)
+    available_qty = abs(signed_qty)
+    if available_qty <= 0:
+        print(f"[POS_MGR] {symbol}: zero available quantity, skipping close")
+        return None
+
+    close_qty = int(min(abs(qty), available_qty)) if qty is not None else int(available_qty)
+    close_qty = max(close_qty, 1)
+    entry_side = "buy" if signed_qty > 0 else "sell"
+    exit_side = "sell" if signed_qty > 0 else "buy"
+    avg_entry_price = float(position.avg_entry_price or 0)
+
+    cancelled = _cancel_open_orders(symbol)
+    if cancelled:
+        print(f"[POS_MGR] {symbol}: cancelled {cancelled} open order(s) before close")
+        if not _wait_for_order_release(symbol):
+            print(f"[POS_MGR] {symbol}: open orders still releasing — attempting close anyway")
+
     @with_retry(max_attempts=3, base_delay=5, default=None, label=f"close_position({symbol})")
     def _do_close():
-        if qty is not None:
-            req = ClosePositionRequest(qty=str(int(qty)))
-            trading_client.close_position(symbol, close_options=req)
+        if close_qty < int(available_qty):
+            req = ClosePositionRequest(qty=str(close_qty))
+            return trading_client.close_position(symbol, close_options=req)
+        return trading_client.close_position(symbol)
+
+    order = _do_close()
+    if order is None:
+        print(f"[POS_MGR] CLOSE FAILED {symbol} — reason: {reason}")
+        return None
+
+    order_id = str(getattr(order, "id", "")) or None
+    fill = _wait_for_order_fill(order_id)
+    fill_qty = float(fill.get("filled_qty") or 0)
+    fill_price = fill.get("fill_price")
+    status = fill.get("status", "pending")
+
+    realized_pnl = None
+    if fill_price is not None and avg_entry_price > 0 and fill_qty > 0:
+        if signed_qty > 0:
+            realized_pnl = (fill_price - avg_entry_price) * fill_qty
         else:
-            trading_client.close_position(symbol)
-    result = _do_close()
-    if result is not None or True:  # always log + update
-        print(f"[POS_MGR] CLOSED {symbol} — reason: {reason}")
-        _update_trade_record(symbol, reason)
+            realized_pnl = (avg_entry_price - fill_price) * fill_qty
+        realized_pnl = round(realized_pnl, 2)
+
+    _log_close_trade(
+        symbol=symbol,
+        side=exit_side,
+        qty=fill_qty or close_qty,
+        alpaca_order_id=order_id,
+        status=status,
+        fill_price=fill_price,
+        pnl=realized_pnl,
+    )
+    if status == "filled":
+        _update_trade_record(symbol, entry_side, realized_pnl)
+
+    if status == "filled":
+        pnl_tag = f" | pnl={realized_pnl:+.2f}" if realized_pnl is not None else ""
+        print(f"[POS_MGR] CLOSED {symbol} — reason: {reason}{pnl_tag}")
+    else:
+        print(f"[POS_MGR] CLOSE SUBMITTED {symbol} — reason: {reason} | status={status}")
+
+    return {
+        "action": "exit",
+        "status": status,
+        "alpaca_order_id": order_id,
+        "qty": int(fill_qty or close_qty),
+        "side": exit_side,
+        "fill_price": fill_price,
+        "pnl": realized_pnl,
+    }
 
 
-def _update_trade_record(symbol: str, exit_reason: str):
+def _log_close_trade(
+    symbol: str,
+    side: str,
+    qty: float,
+    alpaca_order_id: Optional[str],
+    status: str,
+    fill_price: Optional[float],
+    pnl: Optional[float],
+):
+    if not USER_ID:
+        return
+    db_status = "filled" if status == "filled" else "pending"
+    try:
+        supabase.table("trades").insert({
+            "symbol": symbol,
+            "side": side,
+            "qty": int(qty),
+            "fill_qty": int(qty),
+            "order_type": "market",
+            "order_type_detail": "position_close",
+            "alpaca_order_id": alpaca_order_id,
+            "status": db_status,
+            "fill_price": fill_price,
+            "pnl": pnl,
+            "user_id": USER_ID,
+        }).execute()
+    except Exception as e:
+        print(f"[POS_MGR] Close trade insert error: {e}")
+
+
+def _update_trade_record(symbol: str, entry_side: str, realized_pnl: Optional[float]):
     if not USER_ID:
         return
     try:
-        supabase.table("trades").update({
-            "status": "filled",
-        }).eq("symbol", symbol).eq("user_id", USER_ID).eq("status", "pending").execute()
+        if realized_pnl is None:
+            return
+        latest = (
+            supabase.table("trades")
+            .select("id")
+            .eq("symbol", symbol)
+            .eq("user_id", USER_ID)
+            .eq("side", entry_side)
+            .eq("status", "filled")
+            .is_("pnl", "null")
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if latest.data:
+            supabase.table("trades").update({
+                "pnl": realized_pnl,
+            }).eq("id", latest.data[0]["id"]).execute()
     except Exception as e:
         print(f"[POS_MGR] Supabase update error: {e}")
 

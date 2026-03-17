@@ -231,12 +231,15 @@ def get_account_equity() -> float:
 
 
 def is_market_open() -> bool:
-    now_et  = datetime.now(ET)
-    if now_et.weekday() >= 5:
-        return False
-    open_  = now_et.replace(hour=4,  minute=0,  second=0, microsecond=0)
-    close_ = now_et.replace(hour=20, minute=0,  second=0, microsecond=0)
-    return open_ <= now_et <= close_
+    try:
+        return bool(trading_client.get_clock().is_open)
+    except Exception:
+        now_et  = datetime.now(ET)
+        if now_et.weekday() >= 5:
+            return False
+        open_  = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
+        close_ = now_et.replace(hour=16, minute=0,  second=0, microsecond=0)
+        return open_ <= now_et <= close_
 
 
 def is_high_noise_window() -> bool:
@@ -722,16 +725,7 @@ def _place_bracket_orders(symbol: str, side: str, filled_price: float, qty: int,
             stop_price=stop_trigger,
             limit_price=stop_limit,
         )
-        # Take-profit leg: plain GTC limit at take_price
-        take_req = LimitOrderRequest(
-            symbol=asym,
-            qty=qty,
-            side=exit_side,
-            time_in_force=TimeInForce.GTC,
-            limit_price=take_price,
-        )
         trading_client.submit_order(stop_req)
-        trading_client.submit_order(take_req)
         print(f"[BRACKET] {asym}: stop=${stop_trigger} ({stop_pct:.2%}) | take=${take_price} ({take_pct:.2%}) | regime={regime}")
     except Exception as e:
         print(f"[BRACKET] {asym}: bracket order error — {e}")
@@ -1294,6 +1288,8 @@ def run_cycle():
             continue
 
         alpaca_sym = _alpaca_sym(symbol)
+        verdict = referee_verdict(s_result, m_result)
+        tug_result_id = log_tug_result(verdict)
 
         # Determine execution from quantum allocator or legacy verdict
         qa_alloc = qa_allocation.get(symbol)
@@ -1313,18 +1309,13 @@ def run_cycle():
             if exec_side == "sell" and alpaca_sym not in held_symbols and symbol not in held_symbols:
                 continue
 
-            verdict = referee_verdict(s_result, m_result)
             print(f"[REFEREE] {symbol}: QUANTUM {exec_side.upper()} {target_shares} shares "
                   f"(w={qa_alloc['weight']*100:+.1f}%) | Ensemble={ens_score:+.3f}")
-            execute_candidates.append((symbol, verdict, s_result, is_strong, exec_side))
+            execute_candidates.append((symbol, verdict, tug_result_id, s_result, is_strong, exec_side, "quantum_reallocate"))
         else:
             # LEGACY PATH: use ensemble thresholds + verdict logic
-            if alpaca_sym in held_symbols or symbol in held_symbols:
-                skipped_no_signal += 1
-                continue
-
-            verdict = referee_verdict(s_result, m_result)
             is_strong = m_result["direction"] != "neutral"
+            is_held = alpaca_sym in held_symbols or symbol in held_symbols
 
             should_execute = False
             exec_side = verdict["sovereign_direction"]
@@ -1334,11 +1325,14 @@ def run_cycle():
 
             sov_dir = verdict["sovereign_direction"]
             if not should_execute and ens_score > ENSEMBLE_BUY_THRESHOLD and sov_dir in ("buy", "neutral"):
+                if is_held:
+                    skipped_no_signal += 1
+                    continue
                 should_execute = True
                 exec_side = "buy"
                 is_strong = True
             elif not should_execute and ens_score < ENSEMBLE_SELL_THRESHOLD and sov_dir in ("sell", "neutral"):
-                if alpaca_sym in held_symbols or symbol in held_symbols:
+                if is_held:
                     should_execute = True
                     exec_side = "sell"
                     is_strong = True
@@ -1349,18 +1343,18 @@ def run_cycle():
                     if orb_dir == "none" and abs(ens_score) < 0.2:
                         skipped_no_signal += 1
                         continue
-                execute_candidates.append((symbol, verdict, s_result, is_strong, exec_side))
+                execute_candidates.append((symbol, verdict, tug_result_id, s_result, is_strong, exec_side, "referee_signal"))
             elif verdict["verdict"] == "crowded_skip":
                 skipped_crowded += 1
             else:
                 skipped_no_signal += 1
 
     # Apply correlation guard across all candidates
-    candidate_pairs = [(sym, v) for sym, v, _, _, _ in execute_candidates]
+    candidate_pairs = [(sym, v) for sym, v, _, _, _, _, _ in execute_candidates]
     approved_pairs  = filter_by_correlation(candidate_pairs, held_symbols)
     approved_syms   = {sym for sym, _ in approved_pairs}
 
-    for symbol, verdict, s_result, is_strong, exec_side in execute_candidates:
+    for symbol, verdict, tug_result_id, s_result, is_strong, exec_side, exec_reason in execute_candidates:
         if symbol not in approved_syms:
             print(f"[REFEREE] {symbol}: blocked by correlation guard")
             ens = ensemble_map.get(symbol, {})
@@ -1368,8 +1362,9 @@ def run_cycle():
             skipped_crowded += 1
             continue
         # Dynamic limit: if allocator is active, use ceiling; otherwise legacy cap
+        # Exits should never be blocked by entry-capacity checks.
         effective_max = max_positions if qa_allocation else MAX_OPEN_TRADES_LEGACY
-        if open_positions >= effective_max:
+        if exec_side == "buy" and open_positions >= effective_max:
             print(f"[REFEREE] {symbol}: max positions reached ({open_positions}/{effective_max}), skipping")
             ens = ensemble_map.get(symbol, {})
             log_skipped_signal(symbol, exec_side, "max_positions", ens.get("ensemble_score", 0), get_mid_price(symbol))
@@ -1377,9 +1372,10 @@ def run_cycle():
             continue
 
         # Alpha Decay & Turnover Penalty: block flips that don't clear the hurdle
+        # Pure exits should still be allowed through.
         ens = ensemble_map.get(symbol, {})
         ens_score_for_flip = ens.get("ensemble_score", 0.0)
-        if not _passes_turnover_filter(symbol, exec_side, ens_score_for_flip, held_symbols):
+        if exec_side == "buy" and not _passes_turnover_filter(symbol, exec_side, ens_score_for_flip, held_symbols):
             log_skipped_signal(symbol, exec_side, "turnover_filter", ens_score_for_flip, get_mid_price(symbol))
             skipped_no_signal += 1
             continue
@@ -1391,19 +1387,26 @@ def run_cycle():
         else:
             kelly_fraction = s_result["raw_data"].get("kelly_fraction", 0.02)
 
-        result = execute_trade(
-            tug_result_id=log_tug_result(verdict),
-            symbol=symbol,
-            side=exec_side,
-            kelly_fraction=kelly_fraction,
-            equity=equity,
-            is_strong=is_strong,
-            regime=regime,
-        )
+        if exec_side == "sell":
+            result = position_manager.close_position(symbol, exec_reason.upper())
+        else:
+            result = execute_trade(
+                tug_result_id=tug_result_id,
+                symbol=symbol,
+                side=exec_side,
+                kelly_fraction=kelly_fraction,
+                equity=equity,
+                is_strong=is_strong,
+                regime=regime,
+            )
         if result:
-            open_positions += 1
             executed += 1
-            held_symbols.append(symbol)
+            if exec_side == "buy":
+                open_positions += 1
+                held_symbols.append(symbol)
+            elif result.get("status") == "filled" and symbol in held_symbols:
+                open_positions = max(open_positions - 1, 0)
+                held_symbols = [s for s in held_symbols if s != symbol]
 
     qa_tag = f" | QA: {len(qa_allocation)} targets" if qa_allocation else ""
     print(f"\n[REFEREE] Cycle complete — Executed: {executed} | Crowded Skip: {skipped_crowded} | No Signal: {skipped_no_signal} | Regime: {regime.upper()}{qa_tag}")
