@@ -4,7 +4,7 @@
 
 # Tug-Of-War Sovereign Quant Trading System
 
-> An asynchronous, event-driven quantitative trading engine that sits at 0% CPU, consumes real-time market microstructure data across three independent scout processes, and strikes in milliseconds when the math aligns. Built entirely in Python on macOS — no Docker, no cloud VMs, no heavy frameworks.
+> An asynchronous, event-driven quantitative trading engine that sits at 3-4% CPU, consumes real-time market microstructure data across three independent scout processes, and strikes in milliseconds when the math aligns. Built entirely in Python on macOS — no Docker, no cloud VMs, no heavy frameworks.
 
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/)
 [![Alpaca](https://img.shields.io/badge/broker-Alpaca-yellow.svg)](https://alpaca.markets/)
