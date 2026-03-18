@@ -18,8 +18,10 @@ import json
 import time
 import schedule
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 from typing import Optional
+from threading import Lock
 import pytz
 
 # Ensure project root is on sys.path BEFORE any local imports
@@ -298,7 +300,7 @@ def get_micro_price(symbol: str) -> tuple:
         mid = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else float(quote[asym].ask_price or quote[asym].bid_price or 100.0)
         return mid, bid, ask, bid_size, ask_size
     except Exception:
-        return 100.0, 0, 0, 0, 0
+        return 100.0, 100.0, 100.0, 1.0, 1.0
 
 
 def get_mid_price(symbol: str) -> float:
@@ -547,7 +549,7 @@ def execute_crisis_hedges(equity: float, crisis_confidence: float):
       2. Short the weakest watchlist symbol — pure alpha short
 
     Only fires if:
-      - Crisis confidence >= CRISIS_CONF_THRESHOLD (90%)
+      - Crisis confidence ≥ CRISIS_CONF_THRESHOLD (90%)
       - No existing SQQQ position already open
       - Market is open
     """
@@ -786,8 +788,7 @@ def _passes_turnover_filter(
 ) -> bool:
     """
     Prevent position flips unless the expected return of the new signal
-    strictly exceeds the current position's expected return + 2x transaction costs.
-
+    strictly exceeds the current position's expected return PLUS 2x round-trip transaction costs.
     Constraint: E[R_new] > E[R_current] + 2 × (Fees + Slippage)
 
     This kills alpha decay from high turnover — the #1 killer of micro-funds.
@@ -1470,6 +1471,47 @@ def run_once():
 
 _event_sub = None
 _event_log = []  # recent events for TCA/audit trail
+_eda_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="eda")
+_eda_lock = Lock()
+_eda_inflight = set()
+_eda_last_seen = {}
+_eda_cooldowns = {
+    EVT_TRAPPED_EXHAUSTION: 5.0,
+    EVT_SPREAD_BLOW: 10.0,
+    EVT_OFI_EXTREME: 5.0,
+}
+
+
+def _eda_should_process(event_type: str, symbol: str) -> bool:
+    key = (event_type, symbol)
+    now = time.time()
+    cooldown = _eda_cooldowns.get(event_type, 0.0)
+    with _eda_lock:
+        last = _eda_last_seen.get(key, 0.0)
+        if now - last < cooldown:
+            return False
+        _eda_last_seen[key] = now
+    return True
+
+
+def _submit_eda_task(event_type: str, symbol: str, fn, *args):
+    key = (event_type, symbol)
+    with _eda_lock:
+        if key in _eda_inflight:
+            return False
+        _eda_inflight.add(key)
+
+    def _runner():
+        try:
+            fn(*args)
+        except Exception as e:
+            print(f"[EDA] {event_type} background error for {symbol}: {e}")
+        finally:
+            with _eda_lock:
+                _eda_inflight.discard(key)
+
+    _eda_executor.submit(_runner)
+    return True
 
 def _init_event_subscriber():
     """Initialize ZeroMQ subscriber for real-time microstructure events."""
@@ -1493,10 +1535,15 @@ def _handle_trapped_exhaustion(evt: dict):
     """
     symbol = evt.get("symbol", "")
     ofi_z = evt.get("ofi_z", 0)
+    if not _eda_should_process(EVT_TRAPPED_EXHAUSTION, symbol):
+        return
     print(f"[EDA] ⚡ TRAPPED_EXHAUSTION on {symbol} (OFI Z={ofi_z:.2f}) — checking position")
     _event_log.append(evt)
 
-    # Check if we hold this symbol — if so, tighten stop immediately
+    _submit_eda_task(EVT_TRAPPED_EXHAUSTION, symbol, _process_trapped_exhaustion, symbol, ofi_z)
+
+
+def _process_trapped_exhaustion(symbol: str, ofi_z: float):
     try:
         held_qty = get_existing_position_qty(symbol)
         if held_qty > 0:
@@ -1506,7 +1553,6 @@ def _handle_trapped_exhaustion(evt: dict):
     except Exception as e:
         print(f"[EDA] Trapped handler error: {e}")
 
-
 def _handle_spread_blow(evt: dict):
     """
     SPREAD_BLOW: liquidity withdrawal — market makers pulling quotes.
@@ -1514,9 +1560,15 @@ def _handle_spread_blow(evt: dict):
     """
     symbol = evt.get("symbol", "")
     ratio = evt.get("spread_ratio", 0)
+    if not _eda_should_process(EVT_SPREAD_BLOW, symbol):
+        return
     print(f"[EDA] ⚠ SPREAD_BLOW on {symbol} (spread {ratio:.1f}x normal) — cancelling pending orders")
     _event_log.append(evt)
 
+    _submit_eda_task(EVT_SPREAD_BLOW, symbol, _process_spread_blow, symbol)
+
+
+def _process_spread_blow(symbol: str):
     try:
         asym = _alpaca_sym(symbol)
         orders = trading_client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[asym]))
@@ -1527,13 +1579,14 @@ def _handle_spread_blow(evt: dict):
     except Exception as e:
         print(f"[EDA] Spread blow handler error: {e}")
 
-
 def _handle_ofi_extreme(evt: dict):
     """OFI_EXTREME: log for TCA analysis. No immediate action — ensemble handles this."""
     _event_log.append(evt)
     symbol = evt.get("symbol", "")
     direction = evt.get("direction", "")
     ofi_z = evt.get("ofi_z", 0)
+    if not _eda_should_process(EVT_OFI_EXTREME, symbol):
+        return
     print(f"[EDA] 📊 OFI_EXTREME on {symbol}: {direction.upper()} (Z={ofi_z:.2f})")
 
 
