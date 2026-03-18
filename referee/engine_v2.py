@@ -200,7 +200,8 @@ def _reconcile_pending_orders():
             filled_qty = float(o.filled_qty or 0)
             filled_price = float(o.filled_avg_price or 0)
 
-            if "filled" in status_str and filled_qty > 0:
+            is_terminal = any(s in status_str for s in ("filled", "cancel", "expired", "rejected"))
+            if filled_qty > 0 and is_terminal:
                 r = supabase.table("trades").update({
                     "status": "filled",
                     "qty": int(filled_qty),
@@ -209,6 +210,14 @@ def _reconcile_pending_orders():
                 if r.data:
                     updated += 1
                     print(f"[RECONCILE] {o.symbol}: filled {int(filled_qty)} @ ${filled_price:.2f} — Supabase updated")
+            elif filled_qty > 0:
+                r = supabase.table("trades").update({
+                    "qty": int(filled_qty),
+                    "limit_price": round(filled_price, 4),
+                }).eq("alpaca_order_id", oid).eq("status", "pending").execute()
+                if r.data:
+                    updated += 1
+                    print(f"[RECONCILE] {o.symbol}: partial fill {int(filled_qty)} @ ${filled_price:.2f} — Supabase qty updated")
             elif any(s in status_str for s in ("cancel", "expired", "rejected")):
                 r = supabase.table("trades").update({
                     "status": "cancelled",
@@ -326,6 +335,124 @@ def get_existing_position_qty(symbol: str) -> float:
         return float(trading_client.get_open_position(asym).qty)
     except Exception:
         return 0.0
+
+
+def _get_internal_symbol(alpaca_symbol: str) -> str:
+    return next((s for s in WATCHLIST if _alpaca_sym(s) == alpaca_symbol), alpaca_symbol)
+
+
+def _normalize_order_attr(value) -> str:
+    return str(getattr(value, "value", value) or "").lower()
+
+
+def _get_open_order_state() -> tuple:
+    pending_entry_symbols = set()
+    protected_qty_by_symbol = {}
+    try:
+        orders = trading_client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=200))
+        for order in orders:
+            sym = str(order.symbol)
+            order_type = _normalize_order_attr(getattr(order, "order_type", getattr(order, "type", "")))
+            side = _normalize_order_attr(getattr(order, "side", ""))
+            position_intent = _normalize_order_attr(getattr(order, "position_intent", ""))
+            qty = int(float(getattr(order, "qty", 0) or 0))
+
+            if position_intent in ("sell_to_close", "buy_to_close") or order_type == "stop_limit":
+                protected_qty_by_symbol[sym] = protected_qty_by_symbol.get(sym, 0) + max(qty, 0)
+                continue
+
+            is_entry_order = position_intent in ("buy_to_open", "sell_to_open")
+            if not is_entry_order and not position_intent and order_type == "limit" and side in ("buy", "sell"):
+                is_entry_order = True
+            if is_entry_order:
+                pending_entry_symbols.add(sym)
+                pending_entry_symbols.add(_get_internal_symbol(sym))
+    except Exception as e:
+        print(f"[REFEREE] Open order state error: {e}")
+    return pending_entry_symbols, protected_qty_by_symbol
+
+
+def _cancel_stale_entry_orders_for_held_positions():
+    cancelled_symbols = set()
+    try:
+        held_symbols = {str(p.symbol) for p in trading_client.get_all_positions()}
+        orders = trading_client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=200))
+        for order in orders:
+            sym = str(order.symbol)
+            position_intent = _normalize_order_attr(getattr(order, "position_intent", ""))
+            if sym not in held_symbols or position_intent not in ("buy_to_open", "sell_to_open"):
+                continue
+            try:
+                trading_client.cancel_order_by_id(order.id)
+                cancelled_symbols.add(sym)
+                cancelled_symbols.add(_get_internal_symbol(sym))
+                print(f"[RECONCILE] {sym}: cancelled stale entry order {order.id}")
+            except Exception as e:
+                print(f"[RECONCILE] {sym}: stale entry cancel error — {e}")
+    except Exception as e:
+        print(f"[RECONCILE] stale entry cancel scan error: {e}")
+    return cancelled_symbols
+
+
+def _dedupe_pending_entry_orders():
+    cancelled_symbols = set()
+    try:
+        orders = trading_client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=200))
+        grouped_orders = {}
+        for order in orders:
+            sym = str(order.symbol)
+            position_intent = _normalize_order_attr(getattr(order, "position_intent", ""))
+            if position_intent not in ("buy_to_open", "sell_to_open"):
+                continue
+            grouped_orders.setdefault(sym, []).append(order)
+
+        for sym, sym_orders in grouped_orders.items():
+            if len(sym_orders) <= 1:
+                continue
+            sorted_orders = sorted(sym_orders, key=lambda o: getattr(o, "submitted_at", None) or getattr(o, "created_at", None), reverse=True)
+            for stale_order in sorted_orders[1:]:
+                try:
+                    trading_client.cancel_order_by_id(stale_order.id)
+                    cancelled_symbols.add(sym)
+                    cancelled_symbols.add(_get_internal_symbol(sym))
+                    print(f"[RECONCILE] {sym}: cancelled duplicate pending entry {stale_order.id}")
+                except Exception as e:
+                    print(f"[RECONCILE] {sym}: duplicate entry cancel error — {e}")
+    except Exception as e:
+        print(f"[RECONCILE] duplicate entry scan error: {e}")
+    return cancelled_symbols
+
+
+def _ensure_position_protection(regime: str):
+    if regime == "crisis":
+        return
+    try:
+        cancelled_symbols = _cancel_stale_entry_orders_for_held_positions()
+        cancelled_symbols |= _dedupe_pending_entry_orders()
+        positions = trading_client.get_all_positions()
+        pending_entry_symbols, protected_qty_by_symbol = _get_open_order_state()
+        for pos in positions:
+            asym = str(pos.symbol)
+            signed_qty = float(pos.qty or 0)
+            actual_qty = int(abs(signed_qty))
+            if actual_qty <= 0:
+                continue
+            symbol = _get_internal_symbol(asym)
+            if asym in pending_entry_symbols or symbol in pending_entry_symbols or asym in cancelled_symbols or symbol in cancelled_symbols:
+                print(f"[BRACKET] {asym}: deferring protection until stale entry orders fully clear")
+                continue
+            covered_qty = int(protected_qty_by_symbol.get(asym, 0))
+            uncovered_qty = max(actual_qty - covered_qty, 0)
+            if uncovered_qty <= 0:
+                continue
+            entry_side = "buy" if signed_qty > 0 else "sell"
+            entry_price = float(pos.avg_entry_price or pos.current_price or 0)
+            if entry_price <= 0:
+                continue
+            print(f"[BRACKET] {asym}: backfilling protection for {uncovered_qty} uncovered share(s)")
+            _place_bracket_orders(symbol, entry_side, entry_price, uncovered_qty, regime)
+    except Exception as e:
+        print(f"[BRACKET] Protection reconcile error: {e}")
 
 
 # ── P0: Stockformer Live Feature Builder ──────────────────────────────────
@@ -494,11 +621,22 @@ def _result(s, m, conflict, verdict, tug_score):
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
-def log_tug_result(result: dict) -> Optional[str]:
+def log_tug_result(result: dict, ensemble: Optional[dict] = None) -> Optional[str]:
     if not USER_ID:
         return None
     try:
-        resp = supabase.table("tug_results").insert({**result, "user_id": USER_ID}).execute()
+        payload = {**result, "user_id": USER_ID}
+        if ensemble:
+            payload.update({
+                "stockformer_score": ensemble.get("stockformer_component"),
+                "ofi_score": ensemble.get("ofi_component"),
+                "hmm_score": ensemble.get("hmm_component"),
+                "alpha_score": ensemble.get("alpha_component"),
+                "ensemble_score": ensemble.get("ensemble_score"),
+                "ensemble_confidence": ensemble.get("ensemble_confidence"),
+                "ensemble_direction": ensemble.get("ensemble_direction"),
+            })
+        resp = supabase.table("tug_results").insert(payload).execute()
         return resp.data[0]["id"] if resp.data else None
     except Exception as e:
         print(f"[REFEREE] tug_results insert error: {e}")
@@ -573,7 +711,7 @@ def execute_crisis_hedges(equity: float, crisis_confidence: float):
                 time_in_force=TimeInForce.IOC,
                 limit_price=limit_price,
             ))
-            print(f"[CRISIS] SQQQ hedge: BUY {qty} @ ${limit_price} (IOC) | conf={crisis_confidence:.2%} | ID={order.id}")
+            print(f"[CRISIS] SQQQ hedge: BUY {qty} @ ${limit_price:.2f} (IOC) | conf={crisis_confidence:.2%} | ID={order.id}")
             if USER_ID:
                 supabase.table("trades").insert({
                     "symbol": CRISIS_ETF,
@@ -619,7 +757,7 @@ def execute_crisis_hedges(equity: float, crisis_confidence: float):
             time_in_force=TimeInForce.DAY,   # shorts must be DAY orders on Alpaca paper
             limit_price=limit_price,
         ))
-        print(f"[CRISIS] Short {short_sym}: SELL {qty} @ ${limit_price} (DAY) | conf={crisis_confidence:.2%} | ID={order.id}")
+        print(f"[CRISIS] Short {short_sym}: SELL {qty} @ ${limit_price:.2f} (DAY) | conf={crisis_confidence:.2%} | ID={order.id}")
         if USER_ID:
             supabase.table("trades").insert({
                 "symbol": short_sym,
@@ -850,6 +988,14 @@ def execute_trade(
     qty, micro_price, bid, ask, bid_size, ask_size = compute_qty(symbol, kelly_fraction, equity, is_strong)
     qty = max(int(qty), 1)
     order_side = OrderSide.BUY if side == "buy" else OrderSide.SELL
+    asym = _alpaca_sym(symbol)
+
+    if side == "buy":
+        existing_qty = get_existing_position_qty(symbol)
+        pending_entry_symbols, _ = _get_open_order_state()
+        if existing_qty > 0 or asym in pending_entry_symbols or symbol in pending_entry_symbols:
+            print(f"[REFEREE] {symbol}: existing exposure detected at submit time, skipping duplicate buy")
+            return None
 
     # Sell guard: if selling, we must hold the position
     if side == "sell":
@@ -861,7 +1007,6 @@ def execute_trade(
 
     mid_price = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else micro_price
     spread = ask - bid if (bid > 0 and ask > 0) else 0.01
-    asym = _alpaca_sym(symbol)
 
     # ── MAKER/TAKER ROUTING DECISION ─────────────────────────────────
     # Chop regime: be a Maker — post passive limit at the bid/ask
@@ -907,11 +1052,8 @@ def execute_trade(
 
         # ── Check fill status ────────────────────────────────────────
         if use_maker:
-            # MAKER: wait patiently, then apply queue position simulator
             queue_filled = _simulate_queue_fill(symbol, side, limit_price, wait_sec=MAKER_PATIENCE_SEC)
             if not queue_filled:
-                # Queue sim says we wouldn't have filled in real life
-                # Cancel the order and log as queue-blocked
                 try:
                     trading_client.cancel_order_by_id(alpaca_id)
                 except Exception:
@@ -928,92 +1070,111 @@ def execute_trade(
                     }).execute()
                 return None
 
-            # Queue sim passed — check actual Alpaca fill status
             order_status = trading_client.get_order_by_id(alpaca_id)
             status_str = str(order_status.status).lower()
             filled_qty = float(order_status.filled_qty or 0)
         else:
-            # TAKER: IOC — check immediately after brief pause
             time.sleep(2)
             order_status = trading_client.get_order_by_id(alpaca_id)
             status_str = str(order_status.status).lower()
             filled_qty = float(order_status.filled_qty or 0)
 
-        # ── Process fill ─────────────────────────────────────────────
-        if "filled" in status_str and filled_qty > 0:
+        initial_filled_qty = int(filled_qty) if filled_qty > 0 else 0
+        total_filled_qty = 0
+        total_filled_notional = 0.0
+
+        if initial_filled_qty > 0:
             filled_price = float(order_status.filled_avg_price or limit_price)
             real_shortfall = round(abs(filled_price - mid_price) / mid_price * 10000, 2)
             mode_tag = "MAKER" if use_maker else "TAKER"
-            print(f"[FILL] {asym}: {mode_tag} FILLED {int(filled_qty)} @ ${filled_price:.2f} | shortfall={real_shortfall}bps")
+            fill_label = "FILLED" if "filled" in status_str else f"PARTIAL {status_str.upper()}"
+            print(f"[FILL] {asym}: {mode_tag} {fill_label} {initial_filled_qty} @ ${filled_price:.2f} | shortfall={real_shortfall}bps")
             # TCA: measure market impact + schedule adverse selection tracking
-            impact = measure_market_impact(symbol, side, micro_price, filled_price, int(filled_qty))
+            impact = measure_market_impact(symbol, side, micro_price, filled_price, initial_filled_qty)
             print(f"[TCA] {asym}: impact={impact['signed_impact_bps']:+.1f}bps (micro=${micro_price:.2f} fill=${filled_price:.2f})")
             schedule_adverse_selection_check(symbol, side, filled_price, datetime.now(timezone.utc), alpaca_id)
-            _place_bracket_orders(symbol, side, filled_price, int(filled_qty), regime)
             if USER_ID:
                 supabase.table("trades").insert({
                     "tug_result_id": tug_result_id, "symbol": symbol,
-                    "side": side, "qty": int(filled_qty),
-                    "order_type": "limit", "order_type_detail": order_detail,
+                    "side": side, "qty": initial_filled_qty,
+                    "order_type": "limit", "order_type_detail": order_detail if "filled" in status_str else f"{order_detail}_partial",
                     "limit_price": filled_price, "alpaca_order_id": alpaca_id,
                     "status": "filled", "implementation_shortfall_bps": real_shortfall,
                     "user_id": USER_ID,
                 }).execute()
-            return {"alpaca_order_id": alpaca_id, "qty": int(filled_qty), "side": side, "shortfall_bps": real_shortfall}
+            total_filled_qty += initial_filled_qty
+            total_filled_notional += filled_price * initial_filled_qty
+            if use_maker or "filled" in status_str or initial_filled_qty >= qty:
+                avg_filled_price = total_filled_notional / total_filled_qty
+                _place_bracket_orders(symbol, side, avg_filled_price, total_filled_qty, regime)
+                return {"alpaca_order_id": alpaca_id, "qty": total_filled_qty, "side": side, "shortfall_bps": real_shortfall}
 
         # ── Taker IOC missed → fall back to DAY limit with wider slip ─
         if not use_maker:
-            print(f"[FILL] {asym}: IOC {status_str} — retrying as DAY limit")
+            print(f"[FILL] {asym}: IOC {status_str.upper()} — retrying as DAY limit")
             day_slip = 0.0025  # 0.25% — wider to guarantee fill
+            remaining_qty = max(qty - total_filled_qty, 0)
+            if remaining_qty <= 0:
+                return {"alpaca_order_id": alpaca_id, "qty": total_filled_qty, "side": side, "shortfall_bps": shortfall_bps}
             if side == "buy":
                 day_limit = round(mid_price * (1 + day_slip), 2)
             else:
                 day_limit = round(mid_price * (1 - day_slip), 2)
 
             day_req = LimitOrderRequest(
-                symbol=asym, qty=qty, side=order_side,
+                symbol=asym, qty=remaining_qty, side=order_side,
                 time_in_force=TimeInForce.DAY, limit_price=day_limit,
             )
             day_order = trading_client.submit_order(day_req)
             day_id = str(day_order.id)
             day_shortfall = round(abs(day_limit - mid_price) / mid_price * 10000, 2)
-            print(f"[EXEC] DAY fallback: {side.upper()} {int(qty)} {asym} @ ${day_limit} | shortfall={day_shortfall}bps")
+            print(f"[EXEC] DAY fallback: {side.upper()} {int(remaining_qty)} {asym} @ ${day_limit} | shortfall={day_shortfall}bps")
 
             time.sleep(3)
             day_status = trading_client.get_order_by_id(day_id)
             day_status_str = str(day_status.status).lower()
             day_filled_qty = float(day_status.filled_qty or 0)
             day_filled_price = float(day_status.filled_avg_price or day_limit)
+            day_filled_int = int(day_filled_qty) if day_filled_qty > 0 else 0
 
-            if "filled" in day_status_str and day_filled_qty > 0:
+            if day_filled_int > 0:
                 real_shortfall = round(abs(day_filled_price - mid_price) / mid_price * 10000, 2)
-                print(f"[FILL] {asym}: DAY FILLED {int(day_filled_qty)} @ ${day_filled_price:.2f}")
-                impact = measure_market_impact(symbol, side, micro_price, day_filled_price, int(day_filled_qty))
+                fill_label = "DAY FILLED" if "filled" in day_status_str else f"DAY PARTIAL {day_status_str.upper()}"
+                print(f"[FILL] {asym}: {fill_label} {day_filled_int} @ ${day_filled_price:.2f}")
+                impact = measure_market_impact(symbol, side, micro_price, day_filled_price, day_filled_int)
                 print(f"[TCA] {asym}: impact={impact['signed_impact_bps']:+.1f}bps")
                 schedule_adverse_selection_check(symbol, side, day_filled_price, datetime.now(timezone.utc), day_id)
-                _place_bracket_orders(symbol, side, day_filled_price, int(day_filled_qty), regime)
                 if USER_ID:
                     supabase.table("trades").insert({
                         "tug_result_id": tug_result_id, "symbol": symbol,
-                        "side": side, "qty": int(day_filled_qty),
-                        "order_type": "limit", "order_type_detail": "taker_day_fallback",
+                        "side": side, "qty": day_filled_int,
+                        "order_type": "limit", "order_type_detail": "taker_day_fallback" if "filled" in day_status_str else "taker_day_fallback_partial",
                         "limit_price": day_filled_price, "alpaca_order_id": day_id,
                         "status": "filled", "implementation_shortfall_bps": real_shortfall,
                         "user_id": USER_ID,
                     }).execute()
-                return {"alpaca_order_id": day_id, "qty": int(day_filled_qty), "side": side, "shortfall_bps": real_shortfall}
+                total_filled_qty += day_filled_int
+                total_filled_notional += day_filled_price * day_filled_int
+                if "filled" in day_status_str or total_filled_qty >= qty:
+                    avg_filled_price = total_filled_notional / total_filled_qty
+                    _place_bracket_orders(symbol, side, avg_filled_price, total_filled_qty, regime)
+                    return {"alpaca_order_id": day_id, "qty": total_filled_qty, "side": side, "shortfall_bps": real_shortfall}
 
             # Still pending
+            remaining_open_qty = max(remaining_qty - day_filled_int, 0)
+            if total_filled_qty > 0 and remaining_open_qty > 0:
+                print(f"[BRACKET] {asym}: deferring protection for {total_filled_qty} filled share(s) until remaining entry order resolves")
             if USER_ID:
-                supabase.table("trades").insert({
-                    "tug_result_id": tug_result_id, "symbol": symbol,
-                    "side": side, "qty": int(qty),
-                    "order_type": "limit", "order_type_detail": "taker_day_fallback",
-                    "limit_price": day_limit, "alpaca_order_id": day_id,
-                    "status": "pending", "implementation_shortfall_bps": day_shortfall,
-                    "user_id": USER_ID,
-                }).execute()
-            return {"alpaca_order_id": day_id, "qty": int(qty), "side": side, "shortfall_bps": day_shortfall}
+                if remaining_open_qty > 0:
+                    supabase.table("trades").insert({
+                        "tug_result_id": tug_result_id, "symbol": symbol,
+                        "side": side, "qty": int(remaining_open_qty),
+                        "order_type": "limit", "order_type_detail": "taker_day_fallback",
+                        "limit_price": day_limit, "alpaca_order_id": day_id,
+                        "status": "pending", "implementation_shortfall_bps": day_shortfall,
+                        "user_id": USER_ID,
+                    }).execute()
+            return {"alpaca_order_id": day_id, "qty": total_filled_qty + int(remaining_open_qty), "side": side, "shortfall_bps": day_shortfall}
 
         # Maker order still pending after queue sim passed
         if USER_ID:
@@ -1108,6 +1269,7 @@ def run_cycle():
 
     # ── Save last-known-good state for offline cycles ─────────
     _save_cache(regime, crisis_conf, equity)
+    _ensure_position_protection(regime)
 
     # ── Time-of-day filter ────────────────────────────────────
     if is_high_noise_window():
@@ -1201,7 +1363,17 @@ def run_cycle():
     zs_scores = zero_sum_allocation(raw_ens_scores)
     for sym in ensemble_map:
         ensemble_map[sym]["ensemble_score_raw"] = ensemble_map[sym]["ensemble_score"]
-        ensemble_map[sym]["ensemble_score"] = zs_scores.get(sym, ensemble_map[sym]["ensemble_score"])
+        adjusted_score = float(zs_scores.get(sym, ensemble_map[sym]["ensemble_score"]))
+        ensemble_map[sym]["ensemble_score"] = adjusted_score
+        if adjusted_score > 0.05:
+            ensemble_map[sym]["ensemble_direction"] = "buy"
+            ensemble_map[sym]["ensemble_confidence"] = round(min(0.5 + abs(adjusted_score) * 0.45, 0.95), 4)
+        elif adjusted_score < -0.05:
+            ensemble_map[sym]["ensemble_direction"] = "sell"
+            ensemble_map[sym]["ensemble_confidence"] = round(min(0.5 + abs(adjusted_score) * 0.45, 0.95), 4)
+        else:
+            ensemble_map[sym]["ensemble_direction"] = "neutral"
+            ensemble_map[sym]["ensemble_confidence"] = 0.5
 
     # ── Exit checks first ─────────────────────────────────────
     position_manager.run_exit_checks(s_map, m_map, regime=regime)
@@ -1223,6 +1395,9 @@ def run_cycle():
     except Exception:
         held_symbols = []
         current_weights = {}
+    pending_entry_symbols, _ = _get_open_order_state()
+    exposure_symbols = set(held_symbols) | set(pending_entry_symbols)
+    open_exposure_count = len({_get_internal_symbol(sym) for sym in exposure_symbols})
 
     # ── Quantum-Inspired Portfolio Allocation ─────────────────
     # Pass ensemble alpha signals + live covariance to Simulated Annealing
@@ -1290,7 +1465,7 @@ def run_cycle():
 
         alpaca_sym = _alpaca_sym(symbol)
         verdict = referee_verdict(s_result, m_result)
-        tug_result_id = log_tug_result(verdict)
+        tug_result_id = log_tug_result(verdict, ensemble_map.get(symbol))
 
         # Determine execution from quantum allocator or legacy verdict
         qa_alloc = qa_allocation.get(symbol)
@@ -1304,7 +1479,7 @@ def run_cycle():
             is_strong = abs(qa_alloc["weight"]) > 0.05
 
             # Skip if already held in same direction
-            if exec_side == "buy" and (alpaca_sym in held_symbols or symbol in held_symbols):
+            if exec_side == "buy" and (alpaca_sym in exposure_symbols or symbol in exposure_symbols):
                 continue
             # For sells, must hold the position
             if exec_side == "sell" and alpaca_sym not in held_symbols and symbol not in held_symbols:
@@ -1317,6 +1492,7 @@ def run_cycle():
             # LEGACY PATH: use ensemble thresholds + verdict logic
             is_strong = m_result["direction"] != "neutral"
             is_held = alpaca_sym in held_symbols or symbol in held_symbols
+            is_exposed = is_held or alpaca_sym in pending_entry_symbols or symbol in pending_entry_symbols
 
             should_execute = False
             exec_side = verdict["sovereign_direction"]
@@ -1326,7 +1502,7 @@ def run_cycle():
 
             sov_dir = verdict["sovereign_direction"]
             if not should_execute and ens_score > ENSEMBLE_BUY_THRESHOLD and sov_dir in ("buy", "neutral"):
-                if is_held:
+                if is_exposed:
                     skipped_no_signal += 1
                     continue
                 should_execute = True
@@ -1365,8 +1541,8 @@ def run_cycle():
         # Dynamic limit: if allocator is active, use ceiling; otherwise legacy cap
         # Exits should never be blocked by entry-capacity checks.
         effective_max = max_positions if qa_allocation else MAX_OPEN_TRADES_LEGACY
-        if exec_side == "buy" and open_positions >= effective_max:
-            print(f"[REFEREE] {symbol}: max positions reached ({open_positions}/{effective_max}), skipping")
+        if exec_side == "buy" and open_exposure_count >= effective_max:
+            print(f"[REFEREE] {symbol}: max positions reached ({open_exposure_count}/{effective_max}), skipping")
             ens = ensemble_map.get(symbol, {})
             log_skipped_signal(symbol, exec_side, "max_positions", ens.get("ensemble_score", 0), get_mid_price(symbol))
             skipped_crowded += 1
@@ -1404,7 +1580,10 @@ def run_cycle():
             executed += 1
             if exec_side == "buy":
                 open_positions += 1
+                open_exposure_count += 1
                 held_symbols.append(symbol)
+                exposure_symbols.add(symbol)
+                exposure_symbols.add(_alpaca_sym(symbol))
             elif result.get("status") == "filled" and symbol in held_symbols:
                 open_positions = max(open_positions - 1, 0)
                 held_symbols = [s for s in held_symbols if s != symbol]
@@ -1412,7 +1591,7 @@ def run_cycle():
     qa_tag = f" | QA: {len(qa_allocation)} targets" if qa_allocation else ""
     print(f"\n[REFEREE] Cycle complete — Executed: {executed} | Crowded Skip: {skipped_crowded} | No Signal: {skipped_no_signal} | Regime: {regime.upper()}{qa_tag}")
 
-
+# ... (rest of the code remains the same)
 # ── Background Tasks ──────────────────────────────────────────────────────────
 
 def _run_scout_background():
