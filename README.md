@@ -18,13 +18,13 @@
 
 ```
                         ┌─────────────────────────────────────────────────────────┐
-                        │                    PHASE 1: SCOUTS                       │
+                        │                    PHASE 1: SCOUTS                      │
                         │                                                         │
                         │  scout_tape.py ──── OFI, Iceberg, Trapped Exhaustion    │
                         │  scout_dix.py  ──── Dark Pool Short Volume, DIX Index   │
-                        │  regime_hmm.py ──── GEX, SPY Vol → 4-State HMM         │
+                        │  regime_hmm.py ──── GEX, SPY Vol → 4-State HMM          │ 
                         │                          │                              │
-                        │                    ZeroMQ TCP                            │
+                        │                    ZeroMQ TCP                           │
                         │               tcp://127.0.0.1:5555                      │
                         └──────────────────────┬──────────────────────────────────┘
                                                │ JSON payload (<1ms)
